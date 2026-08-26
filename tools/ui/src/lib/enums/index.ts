@@ -68,7 +68,7 @@ export {
 	JsonSchemaType
 } from './mcp.enums';
 
-export { ModelModality } from './model.enums';
+export { ModelCapability, ModelModality } from './model.enums';
 
 export { ServerRole, ServerModelStatus, ServerModelsSseEventType } from './server.enums';
 
