@@ -1488,6 +1488,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     }
 
     LOG_INF("%s : calculating TruthfulQA score over %zu tasks.\n", __func__, tasks.size());
+    LOG_INF("%s : MCLP<TAB>task index<TAB>correct<TAB>chosen<TAB>n_choices<TAB>logprob x n_choices<TAB>tokens x n_choices\n", __func__);
 
     LOG("\ntask\tacc_norm\n");
 
@@ -1653,6 +1654,31 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
 
             // Print the accumulated accuracy mean x 100
             LOG("%d\t%.8lf\n", n_done, 100.*n_correct/n_done);
+
+            // one line per task, for paired comparisons between runs (the score above is unchanged):
+            // MCLP, task index (0-based), correct choice (-1 if none), chosen choice, number of choices,
+            // the mean log-probability per token of each choice (%.9g: the float is read back exactly),
+            // the number of scored tokens of each choice
+            {
+                int correct = -1;
+                for (size_t s = 0; s < cur_task.mc1.labels.size(); ++s) {
+                    if (cur_task.mc1.labels[s] == 1) {
+                        correct = (int) s;
+                        break;
+                    }
+                }
+                std::string line = "MCLP\t" + std::to_string(i) + "\t" + std::to_string(correct) + "\t" +
+                                   std::to_string(logprob_max_idx) + "\t" + std::to_string(cur_task.log_probs.size());
+                char num[32];
+                for (size_t s = 0; s < cur_task.log_probs.size(); ++s) {
+                    snprintf(num, sizeof(num), "\t%.9g", (double) cur_task.log_probs[s]);
+                    line += num;
+                }
+                for (size_t s = 0; s < cur_task.seq_tokens.size(); ++s) {
+                    line += "\t" + std::to_string(cur_task.seq_tokens[s].size() - cur_task.common_prefix);
+                }
+                LOG("%s\n", line.c_str());
+            }
         }
 
         i0 = i1 - 1;
