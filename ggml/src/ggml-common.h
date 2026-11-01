@@ -280,6 +280,31 @@ typedef struct {
 } block_tq1_0;
 static_assert(sizeof(block_tq1_0) == sizeof(ggml_half) + QK_K / 64 + (QK_K - 4 * QK_K / 64) / 5, "wrong tq1_0 block size/padding");
 
+// 1.75 bpw
+// Ternary weights in a rotated basis: a block of 1024 weights w is stored as q ~= H(S*w), where H is the
+// normalized Sylvester-Hadamard transform of size 1024 and S a fixed +-1 sign vector, with one fp16 scale
+// per 128 rotated weights. The 1024 trits are 4 quarters of 256, each packed exactly like block_tq1_0
+// (qs: 5 trits per byte, qh: 4 trits per byte), so a quarter decodes with the TQ1_0 decoder.
+#define QK_TQ1_0R_1024 1024
+typedef struct {
+    uint8_t qs[4][(QK_K - 4 * QK_K / 64) / 5]; // 4 quarters x 48 bytes
+    uint8_t qh[4][QK_K/64];                    // 4 quarters x 4 bytes
+    ggml_half d[8];                            // one scale per 128 weights: d[i/128]
+} block_tq1_0r_1024;
+static_assert(sizeof(block_tq1_0r_1024) == 8 * sizeof(ggml_half) + 4 * (QK_K / 64) + 4 * ((QK_K - 4 * QK_K / 64) / 5), "wrong tq1_0r_1024 block size/padding");
+
+// Packed multi-plane ternary blocks: K planes of the base block for the same weights, back to back.
+// The weight is the sum of the planes. The bytes of a packed block are exactly the bytes of the K
+// separate base blocks, so the size is K times the base type.
+typedef struct { block_tq1_0r_1024 p[2]; } block_tq1_0r_1024_x2;
+typedef struct { block_tq1_0r_1024 p[3]; } block_tq1_0r_1024_x3;
+typedef struct { block_tq1_0r_1024 p[4]; } block_tq1_0r_1024_x4;
+static_assert(sizeof(block_tq1_0r_1024_x4) == 4 * sizeof(block_tq1_0r_1024), "wrong tq1_0r_1024_x4 block size/padding");
+typedef struct { block_tq1_0 p[2]; } block_tq1_0_x2;
+typedef struct { block_tq1_0 p[3]; } block_tq1_0_x3;
+typedef struct { block_tq1_0 p[4]; } block_tq1_0_x4;
+static_assert(sizeof(block_tq1_0_x4) == 4 * sizeof(block_tq1_0), "wrong tq1_0_x4 block size/padding");
+
 // 2.0625 bpw
 typedef struct {
     uint8_t qs[QK_K/4]; // 2 bits per element

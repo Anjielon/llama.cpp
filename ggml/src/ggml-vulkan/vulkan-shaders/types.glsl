@@ -304,6 +304,32 @@ struct block_q2_K_packed32
 #define DATA_A_QUANT_K
 #endif
 
+// Packed multi-plane ternary types: a packed block holds PACKED_K blocks of the base type for the same
+// weights, back to back (plane k of packed block b is base block b*PACKED_K + k); the weight is the sum
+// of the planes. The shaders are compiled for the base type with PACKED_K > 1.
+#if defined(DATA_A_TQ1_0R_1024_X2)
+#define DATA_A_TQ1_0R_1024 1
+#define PACKED_K 2
+#elif defined(DATA_A_TQ1_0R_1024_X3)
+#define DATA_A_TQ1_0R_1024 1
+#define PACKED_K 3
+#elif defined(DATA_A_TQ1_0R_1024_X4)
+#define DATA_A_TQ1_0R_1024 1
+#define PACKED_K 4
+#elif defined(DATA_A_TQ1_0_X2)
+#define DATA_A_TQ1_0 1
+#define PACKED_K 2
+#elif defined(DATA_A_TQ1_0_X3)
+#define DATA_A_TQ1_0 1
+#define PACKED_K 3
+#elif defined(DATA_A_TQ1_0_X4)
+#define DATA_A_TQ1_0 1
+#define PACKED_K 4
+#endif
+#ifndef PACKED_K
+#define PACKED_K 1
+#endif
+
 #define QUANT_K_TQ1_0 256
 
 // TQ1_0: base-3 packed trits, 5 per byte in `qs` (48B) and 4 in `qh` (4B).
@@ -336,6 +362,24 @@ uint tq1_0_trit(uint qbyte, uint t) {
 #define QUANT_K QUANT_K_TQ1_0
 #define QUANT_R 1
 #define A_TYPE block_tq1_0
+#define DATA_A_QUANT_K
+#endif
+
+#define QUANT_K_TQ1_0R_1024 1024
+
+// TQ1_0R_1024: ternary weights in a Hadamard-1024 rotated basis, 4 quarters of 256 trits packed like
+// block_tq1_0 (qs: 4 x 48 bytes, qh: 4 x 4 bytes) and one fp16 scale per 128 weights (224 bytes)
+struct block_tq1_0r_1024
+{
+    uint8_t qs[4 * 48];
+    uint8_t qh[4 * 4];
+    float16_t d[8];
+};
+
+#if defined(DATA_A_TQ1_0R_1024)
+#define QUANT_K QUANT_K_TQ1_0R_1024
+#define QUANT_R 1
+#define A_TYPE block_tq1_0r_1024
 #define DATA_A_QUANT_K
 #endif
 

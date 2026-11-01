@@ -1,0 +1,49 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "tq1_0r_1024_common.glsl"
+
+// Activation side of TQ1_0R_1024: y' = (1/32) H (S * y) for every block of 1024 values.
+// Since H is symmetric and orthonormal and S is diagonal, dot(S H (d * t), y) == dot(d * t, y'), so the
+// matrix kernels decode the weights without any rotation. One workgroup per block (grid-stride), radix-2
+// FWHT in shared memory with the same butterfly convention as the CPU reference. Works in place.
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne;
+} p;
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared float sh[1024];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nblk = p.ne / 1024u;
+    for (uint blk = gl_WorkGroupID.x; blk < nblk; blk += gl_NumWorkGroups.x) {
+        const uint base = blk * 1024u;
+        for (uint e = tid; e < 1024u; e += 256u) {
+            sh[e] = float(data_a[base + e]) * (tq1_0r_1024_sign(e) * 0.03125);
+        }
+        barrier();
+        for (uint s = 0u; s < 10u; ++s) {
+            const uint len = 1u << s;
+            for (uint pi = tid; pi < 512u; pi += 256u) {
+                const uint i = ((pi >> s) << (s + 1u)) | (pi & (len - 1u));
+                const uint j = i | len;
+                const float u = sh[i];
+                const float w = sh[j];
+                sh[i] = u + w;
+                sh[j] = u - w;
+            }
+            barrier();
+        }
+        for (uint e = tid; e < 1024u; e += 256u) {
+            data_d[base + e] = D_TYPE(sh[e]);
+        }
+        barrier();
+    }
+}

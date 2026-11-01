@@ -121,6 +121,47 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+void quantize_row_tq1_0r_1024(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ1_0R_1024 == 0);
+    block_tq1_0r_1024 * GGML_RESTRICT y = vy;
+    quantize_row_tq1_0r_1024_ref(x, y, k);
+}
+
+void quantize_row_tq1_0r_1024_x2(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    quantize_row_tq1_0r_1024_x2_ref(x, (block_tq1_0r_1024_x2 *) vy, k);
+}
+
+void quantize_row_tq1_0r_1024_x3(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    quantize_row_tq1_0r_1024_x3_ref(x, (block_tq1_0r_1024_x3 *) vy, k);
+}
+
+void quantize_row_tq1_0r_1024_x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    quantize_row_tq1_0r_1024_x4_ref(x, (block_tq1_0r_1024_x4 *) vy, k);
+}
+
+void quantize_row_tq1_0_x2(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    quantize_row_tq1_0_x2_ref(x, (block_tq1_0_x2 *) vy, k);
+}
+
+void quantize_row_tq1_0_x3(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    quantize_row_tq1_0_x3_ref(x, (block_tq1_0_x3 *) vy, k);
+}
+
+void quantize_row_tq1_0_x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    quantize_row_tq1_0_x4_ref(x, (block_tq1_0_x4 *) vy, k);
+}
+
+void quantize_row_q8_K_rot1024(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TQ1_0R_1024 == 0);
+    block_q8_K * GGML_RESTRICT y = vy;
+    float tmp[QK_TQ1_0R_1024];
+    for (int64_t i = 0; i < k / QK_TQ1_0R_1024; ++i) {
+        memcpy(tmp, x + i * QK_TQ1_0R_1024, sizeof(tmp));
+        ggml_tq1_0r_1024_rotate_act(tmp);
+        quantize_row_q8_K(tmp, y + i * (QK_TQ1_0R_1024 / QK_K), QK_TQ1_0R_1024);
+    }
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -577,6 +618,91 @@ void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 
     *s = sumf;
 }
+
+// TQ1_0R_1024 x Q8_K: the Q8_K activation is already rotated per 1024 block (quantize_row_q8_K_rot1024),
+// so the trits are dotted in integers like TQ1_0. Each quarter of 256 is one Q8_K block, split in two
+// halves of 128 with one scale each (d[2q], d[2q+1]). Quarter layout = block_tq1_0: qs[0..31] x 5 trits
+// -> elements l*32+m (l < 4: first half, l == 4: second half), qs[32..47] x 5 -> 160+l*16+m,
+// qh x 4 -> 240+l*4+j (all in the second half).
+void ggml_vec_dot_tq1_0r_1024_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq1_0r_1024 * GGML_RESTRICT x = vx;
+    const block_q8_K        * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ1_0R_1024;
+
+    static const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        for (int q = 0; q < 4; ++q) {
+            const uint8_t * GGML_RESTRICT qs = x[i].qs[q];
+            const uint8_t * GGML_RESTRICT qh = x[i].qh[q];
+            const block_q8_K * GGML_RESTRICT yb = y + 4*i + q;
+            const int8_t * GGML_RESTRICT yq = yb->qs;
+
+            int s0 = 0;
+            int s1 = 0;
+            for (int l = 0; l < 5; ++l) {
+                int acc = 0;
+                for (int m = 0; m < 32; ++m) {
+                    const uint8_t t = qs[m] * pow3[l];
+                    acc += ((((uint16_t) t * 3) >> 8) - 1) * yq[l*32 + m];
+                }
+                if (l < 4) { s0 += acc; } else { s1 += acc; }
+            }
+            for (int l = 0; l < 5; ++l) {
+                for (int m = 0; m < 16; ++m) {
+                    const uint8_t t = qs[32 + m] * pow3[l];
+                    s1 += ((((uint16_t) t * 3) >> 8) - 1) * yq[160 + l*16 + m];
+                }
+            }
+            for (int l = 0; l < 4; ++l) {
+                for (int j = 0; j < 4; ++j) {
+                    const uint8_t t = qh[j] * pow3[l];
+                    s1 += ((((uint16_t) t * 3) >> 8) - 1) * yq[240 + l*4 + j];
+                }
+            }
+            sumf += yb->d * ((float) s0 * GGML_CPU_FP16_TO_FP32(x[i].d[2*q]) +
+                             (float) s1 * GGML_CPU_FP16_TO_FP32(x[i].d[2*q + 1]));
+        }
+    }
+
+    *s = sumf;
+}
+
+// packed multi-plane types: the planes of a block share the activation block, dot plane by plane
+#define GGML_PACKED_DOT(NAME, BASE, QK, K)                                                                       \
+void ggml_vec_dot_##NAME##_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,        \
+                                size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {                 \
+    assert(nrc == 1);                                                                                            \
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);                                                             \
+    const block_##NAME * GGML_RESTRICT x = vx;                                                                   \
+    const block_q8_K   * GGML_RESTRICT y = vy;                                                                   \
+    const int nb = n / QK;                                                                                       \
+    float sumf = 0.0f;                                                                                           \
+    for (int i = 0; i < nb; ++i) {                                                                               \
+        for (int pl = 0; pl < K; ++pl) {                                                                         \
+            float t;                                                                                             \
+            ggml_vec_dot_##BASE##_q8_K(QK, &t, 0, &x[i].p[pl], 0, y + i * (QK / QK_K), 0, 1);                    \
+            sumf += t;                                                                                           \
+        }                                                                                                        \
+    }                                                                                                            \
+    *s = sumf;                                                                                                   \
+}
+GGML_PACKED_DOT(tq1_0r_1024_x2, tq1_0r_1024, QK_TQ1_0R_1024, 2)
+GGML_PACKED_DOT(tq1_0r_1024_x3, tq1_0r_1024, QK_TQ1_0R_1024, 3)
+GGML_PACKED_DOT(tq1_0r_1024_x4, tq1_0r_1024, QK_TQ1_0R_1024, 4)
+GGML_PACKED_DOT(tq1_0_x2,       tq1_0,       QK_K,           2)
+GGML_PACKED_DOT(tq1_0_x3,       tq1_0,       QK_K,           3)
+GGML_PACKED_DOT(tq1_0_x4,       tq1_0,       QK_K,           4)
+#undef GGML_PACKED_DOT
 
 void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);

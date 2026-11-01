@@ -419,6 +419,52 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_TQ1_0R_1024] = {
+        .from_float               = quantize_row_tq1_0r_1024,
+        .vec_dot                  = ggml_vec_dot_tq1_0r_1024_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+        .from_float_act           = quantize_row_q8_K_rot1024,
+    },
+    [GGML_TYPE_TQ1_0R_1024_X2] = {
+        .from_float               = quantize_row_tq1_0r_1024_x2,
+        .vec_dot                  = ggml_vec_dot_tq1_0r_1024_x2_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+        .from_float_act           = quantize_row_q8_K_rot1024,
+    },
+    [GGML_TYPE_TQ1_0R_1024_X3] = {
+        .from_float               = quantize_row_tq1_0r_1024_x3,
+        .vec_dot                  = ggml_vec_dot_tq1_0r_1024_x3_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+        .from_float_act           = quantize_row_q8_K_rot1024,
+    },
+    [GGML_TYPE_TQ1_0R_1024_X4] = {
+        .from_float               = quantize_row_tq1_0r_1024_x4,
+        .vec_dot                  = ggml_vec_dot_tq1_0r_1024_x4_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+        .from_float_act           = quantize_row_q8_K_rot1024,
+    },
+    [GGML_TYPE_TQ1_0_X2] = {
+        .from_float               = quantize_row_tq1_0_x2,
+        .vec_dot                  = ggml_vec_dot_tq1_0_x2_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ1_0_X3] = {
+        .from_float               = quantize_row_tq1_0_x3,
+        .vec_dot                  = ggml_vec_dot_tq1_0_x3_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ1_0_X4] = {
+        .from_float               = quantize_row_tq1_0_x4,
+        .vec_dot                  = ggml_vec_dot_tq1_0_x4_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
@@ -1261,6 +1307,18 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// activation conversion to vec_dot_type for src0 type t, and the unit (in elements) in which threads split
+// an activation row: a whole block of t when its vec_dot expects transformed activations
+static inline ggml_from_float_t ggml_cpu_act_from_float(enum ggml_type t) {
+    const struct ggml_type_traits_cpu * tr = &type_traits_cpu[t];
+    return tr->from_float_act ? tr->from_float_act : type_traits_cpu[tr->vec_dot_type].from_float;
+}
+
+static inline int64_t ggml_cpu_act_blck_size(enum ggml_type t) {
+    const struct ggml_type_traits_cpu * tr = &type_traits_cpu[t];
+    return tr->from_float_act ? ggml_blck_size(t) : ggml_blck_size(tr->vec_dot_type);
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1285,7 +1343,7 @@ void ggml_compute_forward_mul_mat(
     const int nth = params->nth;
 
     enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
-    ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
+    ggml_from_float_t        const from_float           = ggml_cpu_act_from_float(src0->type);
     int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
 
     GGML_ASSERT(ne0 == ne01);
@@ -1360,7 +1418,8 @@ UseGgmlGemm1:;
             }
         }
     #else
-        const int64_t bs = ggml_blck_size(vec_dot_type);
+        const int64_t bs    = widen ? ggml_blck_size(vec_dot_type) : ggml_cpu_act_blck_size(src0->type);
+        const size_t  nbw_b = widen ? nbw0 : ggml_row_size(vec_dot_type, bs);
 
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
@@ -1368,7 +1427,7 @@ UseGgmlGemm1:;
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
                     const void * src1_row  = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
-                    void       * wdata_row =                    wdata  + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
+                    void       * wdata_row =                    wdata  + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw_b;
 
                     const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
 
@@ -1578,7 +1637,7 @@ static void ggml_compute_forward_mul_mat_id(
     const bool src1_cont = ggml_is_contiguous(src1);
 
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
-    ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
+    ggml_from_float_t const from_float      = ggml_cpu_act_from_float(type);
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -1618,7 +1677,6 @@ static void ggml_compute_forward_mul_mat_id(
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
-        const size_t nbw0 = ggml_type_size(vec_dot_type);
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
@@ -1640,11 +1698,12 @@ static void ggml_compute_forward_mul_mat_id(
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
+                    const int64_t bs    = ggml_cpu_act_blck_size(type);
+                    const size_t  nbw_b = ggml_row_size(vec_dot_type, bs);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw_b),
                                (ne10_block_end - ne10_block_start) * bs);
                 }
             }
