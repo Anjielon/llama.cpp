@@ -30,6 +30,11 @@ constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
 constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
 constexpr float MAX_DOT_PRODUCT_ERROR_BINARY = 0.40f;
 constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
+// TQ1_0R_1024 rotates each block of 1024 with a Hadamard transform before ternarization; on this smooth
+// low-frequency synthetic signal the rotation does not help and the error is slightly higher than plain
+// TQ1_0 (measured: 0.0095 and 0.193)
+constexpr float MAX_QUANTIZATION_TOTAL_ERROR_TERNARY_ROT = 0.012f;
+constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY_ROT = 0.25f;
 
 static const char* RESULT_STR[] = {"ok", "FAILED"};
 
@@ -98,8 +103,11 @@ static float dot_product_error(const ggml_type_traits_cpu * qfns_cpu, ggml_type 
     std::vector<uint8_t> tmp_q1(bx * nrc);
     std::vector<uint8_t> tmp_q2(by * nrc);
 
+    // some types expect transformed activations (see ggml_type_traits_cpu::from_float_act)
+    const ggml_from_float_t from_act = qfns_cpu->from_float_act ? qfns_cpu->from_float_act : vdot->from_float;
+
     qfns_cpu->from_float(test_data1, tmp_q1.data(), test_size);
-    vdot->from_float(test_data2, tmp_q2.data(), test_size);
+    from_act(test_data2, tmp_q2.data(), test_size);
 
     if (nrc == 1) {
         float result = INFINITY;
@@ -113,7 +121,7 @@ static float dot_product_error(const ggml_type_traits_cpu * qfns_cpu, ggml_type 
     // Output layout: s[0]=dot(vx0,vy0), s[1]=dot(vx1,vy0), s[bs]=dot(vx0,vy1), s[bs+1]=dot(vx1,vy1)
     // row and output strides are padded, same as in the mul_mat path
     qfns_cpu->from_float(test_data3, tmp_q1.data() + bx, test_size);
-    vdot->from_float(test_data4, tmp_q2.data() + by, test_size);
+    from_act(test_data4, tmp_q2.data() + by, test_size);
 
     const size_t bs = 16;
     std::vector<float> result(bs + 2, INFINITY);
@@ -337,6 +345,9 @@ static int test_vec_dot_q(bool verbose) {
             const float max_quantization_error =
                 type == GGML_TYPE_Q1_0    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_TQ1_0_X2 || type == GGML_TYPE_TQ1_0_X3 || type == GGML_TYPE_TQ1_0_X4 ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_TQ1_0R_1024 || type == GGML_TYPE_TQ1_0R_1024_X2 ||
+                type == GGML_TYPE_TQ1_0R_1024_X3 || type == GGML_TYPE_TQ1_0R_1024_X4 ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY_ROT :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
@@ -364,7 +375,11 @@ static int test_vec_dot_q(bool verbose) {
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                 : type == GGML_TYPE_Q1_0
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
-                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0
+                : type == GGML_TYPE_TQ1_0R_1024 || type == GGML_TYPE_TQ1_0R_1024_X2 ||
+                  type == GGML_TYPE_TQ1_0R_1024_X3 || type == GGML_TYPE_TQ1_0R_1024_X4
+                ? MAX_DOT_PRODUCT_ERROR_TERNARY_ROT
+                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 ||
+                  type == GGML_TYPE_TQ1_0_X2 || type == GGML_TYPE_TQ1_0_X3 || type == GGML_TYPE_TQ1_0_X4
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
                 : type == GGML_TYPE_NVFP4
                 ? MAX_DOT_PRODUCT_ERROR_FP4

@@ -433,7 +433,16 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_COUNT   = 44,
+        // 44: unused
+        GGML_TYPE_TQ1_0R_1024    = 45, // ternary, Hadamard-1024 rotated basis, 8 fp16 scales per 1024 (1.75 bpw)
+        // packed multi-plane ternary types: K planes of the base type for the same weights, summed
+        GGML_TYPE_TQ1_0R_1024_X2 = 46,
+        GGML_TYPE_TQ1_0R_1024_X3 = 47,
+        GGML_TYPE_TQ1_0R_1024_X4 = 48,
+        GGML_TYPE_TQ1_0_X2       = 49,
+        GGML_TYPE_TQ1_0_X3       = 50,
+        GGML_TYPE_TQ1_0_X4       = 51,
+        GGML_TYPE_COUNT          = 52,
     };
 
     // [TAG_GGML_PREC]

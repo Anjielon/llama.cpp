@@ -11231,6 +11231,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // TQ1_0R_1024 and its packed multi-plane variants: k must be a multiple of the 1024 block
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0R_1024, GGML_TYPE_TQ1_0R_1024_X2, GGML_TYPE_TQ1_0R_1024_X3, GGML_TYPE_TQ1_0R_1024_X4}) {
+        for (int n : {1, 2, 5, 8, 9, 32, 512}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, 2048, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 3, 3072, {2, 1}, {1, 1}));
+        test_cases.emplace_back(new test_get_rows(type_a, 2048, 5, 4, 1, 1, false));
+        test_cases.emplace_back(new test_get_rows(type_a, 1024, 5, 4, 2, 1, true));
+        for (int n : {1, 3, 8, 9, 32}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 512, n, 2048));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, true, 512, 5, 2048));
+    }
+    // packed multi-plane TQ1_0
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0_X2, GGML_TYPE_TQ1_0_X3, GGML_TYPE_TQ1_0_X4}) {
+        for (int n : {1, 2, 8, 9, 32}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, 512, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_get_rows(type_a, 512, 5, 4, 1, 1, false));
+        for (int n : {1, 9}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 2048, n, 512));
+        }
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));

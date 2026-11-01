@@ -1569,6 +1569,91 @@ void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+void ggml_vec_dot_tq1_0r_1024_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq1_0r_1024 * GGML_RESTRICT x = vx;
+    const block_q8_K        * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_TQ1_0R_1024;
+
+#if defined(__AVX2__)
+    // same trit decode as ggml_vec_dot_tq1_0_q8_K, with the trits kept as 0..2:
+    // the -1 offset is applied once per 128 half through bsums
+    const __m256i m8    = _mm256_set1_epi8(-8);
+    const __m256i one   = _mm256_set1_epi8(1);
+    const __m256i three = _mm256_set1_epi8(3);
+    const __m256i zero  = _mm256_setzero_si256();
+    const __m256i ones16 = _mm256_set1_epi16(1);
+#define TQ1R_TRIT(v) _mm256_and_si256(_mm256_srli_epi16(_mm256_avg_epu8(_mm256_subs_epu8((v), one), _mm256_avg_epu8(_mm256_subs_epu8((v), one), zero)), 6), three)
+    __m256 acc = _mm256_setzero_ps();
+    float corr = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        for (int q = 0; q < 4; ++q) {
+            const uint8_t    * GGML_RESTRICT qs = x[i].qs[q];
+            const block_q8_K * GGML_RESTRICT yb = y + 4*i + q;
+            __m256i h0, h1;
+            {
+                // first 32 bytes: 5 trits each -> elements 0..159
+                const __m256i qx0 = _mm256_loadu_si256((const __m256i *) qs);
+                const __m256i qx1 = _mm256_add_epi8(qx0, _mm256_add_epi8(qx0, qx0));
+                const __m256i qx2 = _mm256_add_epi8(_mm256_and_si256(_mm256_slli_epi16(qx0, 3), m8), qx0);
+                const __m256i qx3 = _mm256_add_epi8(_mm256_and_si256(_mm256_slli_epi16(qx1, 3), m8), qx1);
+                const __m256i qx4 = _mm256_add_epi8(_mm256_and_si256(_mm256_slli_epi16(qx2, 3), m8), qx2);
+                const __m256i p0 = _mm256_maddubs_epi16(TQ1R_TRIT(qx0), _mm256_loadu_si256((const __m256i *) (yb->qs +   0)));
+                const __m256i p1 = _mm256_maddubs_epi16(TQ1R_TRIT(qx1), _mm256_loadu_si256((const __m256i *) (yb->qs +  32)));
+                const __m256i p2 = _mm256_maddubs_epi16(TQ1R_TRIT(qx2), _mm256_loadu_si256((const __m256i *) (yb->qs +  64)));
+                const __m256i p3 = _mm256_maddubs_epi16(TQ1R_TRIT(qx3), _mm256_loadu_si256((const __m256i *) (yb->qs +  96)));
+                h0 = _mm256_add_epi16(_mm256_add_epi16(p0, p1), _mm256_add_epi16(p2, p3));
+                h1 = _mm256_maddubs_epi16(TQ1R_TRIT(qx4), _mm256_loadu_si256((const __m256i *) (yb->qs + 128)));
+            }
+            {
+                // last 16 bytes of qs (5 trits each) and qh (4 trits each) -> elements 160..255
+                const __m128i qx0 = _mm_loadu_si128((const __m128i *) (qs + 32));
+                uint32_t qhw;
+                memcpy(&qhw, x[i].qh[q], sizeof(qhw));
+                __m256i qx5_l = _mm256_cvtepu8_epi16(_mm_set1_epi32(qhw));
+                const __m128i qx1 = _mm_add_epi8(qx0, _mm_add_epi8(qx0, qx0));
+                const __m128i qx2 = _mm_add_epi8(_mm_and_si128(_mm_slli_epi16(qx0, 3), _mm_set1_epi8(-8)), qx0);
+                const __m128i qx3 = _mm_add_epi8(_mm_and_si128(_mm_slli_epi16(qx1, 3), _mm_set1_epi8(-8)), qx1);
+                const __m128i qx4 = _mm_add_epi8(_mm_and_si128(_mm_slli_epi16(qx2, 3), _mm_set1_epi8(-8)), qx2);
+                qx5_l = _mm256_mullo_epi16(qx5_l, _mm256_set_epi16(27, 27, 27, 27, 9, 9, 9, 9, 3, 3, 3, 3, 1, 1, 1, 1));
+                qx5_l = _mm256_and_si256(qx5_l, _mm256_set1_epi16(0xFF));
+                const __m128i qx5 = _mm_packus_epi16(_mm256_castsi256_si128(qx5_l), _mm256_extracti128_si256(qx5_l, 1));
+                const __m256i qx01 = MM256_SET_M128I(qx1, qx0);
+                const __m256i qx23 = MM256_SET_M128I(qx3, qx2);
+                const __m256i qx45 = MM256_SET_M128I(qx5, qx4);
+                h1 = _mm256_add_epi16(h1, _mm256_maddubs_epi16(TQ1R_TRIT(qx01), _mm256_loadu_si256((const __m256i *) (yb->qs + 160))));
+                h1 = _mm256_add_epi16(h1, _mm256_maddubs_epi16(TQ1R_TRIT(qx23), _mm256_loadu_si256((const __m256i *) (yb->qs + 192))));
+                h1 = _mm256_add_epi16(h1, _mm256_maddubs_epi16(TQ1R_TRIT(qx45), _mm256_loadu_si256((const __m256i *) (yb->qs + 224))));
+            }
+            const float d0 = yb->d * GGML_CPU_FP16_TO_FP32(x[i].d[2*q]);
+            const float d1 = yb->d * GGML_CPU_FP16_TO_FP32(x[i].d[2*q + 1]);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(h0, ones16)), _mm256_set1_ps(d0), acc);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(h1, ones16)), _mm256_set1_ps(d1), acc);
+            int b0 = 0, b1 = 0;
+            for (int k = 0; k < 8; ++k) {
+                b0 += yb->bsums[k];
+                b1 += yb->bsums[8 + k];
+            }
+            corr += d0 * (float) b0 + d1 * (float) b1;
+        }
+    }
+#undef TQ1R_TRIT
+
+    *s = hsum_float_8(acc) - corr;
+#else
+    UNUSED(x);
+    UNUSED(y);
+    UNUSED(nb);
+    ggml_vec_dot_tq1_0r_1024_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

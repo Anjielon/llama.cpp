@@ -2480,6 +2480,308 @@ void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ====================== TQ1_0R_1024: ternary weights in a Hadamard-1024 rotated basis
+//
+// A block of 1024 weights w is rotated with R = (1/sqrt(1024)) H S before ternarization, where H is the
+// Sylvester-Hadamard matrix (symmetric, H*H = 1024 I) and S a fixed +-1 sign vector (randomized Hadamard
+// transform, as in QuaRot/SpinQuant). The rotated weights get one scale per 128 values:
+//
+//   quantize:   q ~= H(S*w)                        (S first, then H)
+//   dequantize: w ~= S*(H(d*q))                    (H first, then S)
+//   activation: x' = H(S*x)  =>  dot(w, x) == dot(d*q, x')
+//
+// The butterfly convention is the classic Sylvester one: for a pair (i, j = i + len),
+// v[i] = v[i] + v[j], v[j] = v[i] - v[j]; the 1/32 normalization is a power of two, hence exact.
+//
+// S is the output of numpy.random.default_rng(20260920).choice([-1.0, 1.0], size=1024).
+static const int8_t ggml_tq1_0r_1024_sign[QK_TQ1_0R_1024] = {
+     1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1, -1, -1,
+    -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1,  1, -1,  1,
+    -1, -1,  1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1,
+    -1, -1,  1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1,  1, -1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1, -1,
+     1,  1, -1,  1,  1,  1, -1,  1,  1,  1, -1,  1,  1,  1,  1, -1,
+     1,  1,  1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1,
+    -1, -1, -1, -1, -1,  1, -1, -1,  1,  1,  1, -1, -1,  1,  1,  1,
+    -1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1,  1,  1,  1,  1, -1,
+    -1, -1, -1,  1, -1,  1, -1, -1,  1,  1, -1, -1, -1, -1, -1, -1,
+    -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1,  1,
+     1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1,  1,  1, -1,  1,  1,
+     1, -1, -1, -1, -1,  1,  1,  1, -1, -1, -1,  1, -1, -1, -1, -1,
+    -1, -1,  1, -1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1, -1,
+     1, -1,  1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1,  1,  1, -1,
+    -1, -1,  1, -1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1,  1, -1,
+    -1,  1, -1,  1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1,
+     1,  1,  1, -1, -1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1, -1,
+    -1,  1, -1, -1,  1, -1,  1,  1, -1,  1,  1, -1, -1,  1, -1, -1,
+    -1, -1,  1,  1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1,  1,
+    -1, -1, -1,  1,  1,  1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1,
+     1,  1, -1, -1, -1,  1, -1,  1,  1,  1, -1, -1, -1,  1,  1, -1,
+     1, -1, -1,  1, -1, -1, -1, -1,  1, -1, -1, -1,  1,  1, -1, -1,
+    -1,  1,  1,  1, -1, -1,  1, -1, -1,  1, -1,  1, -1,  1,  1,  1,
+     1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1,
+    -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1,
+     1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1, -1,  1, -1,  1, -1,
+     1, -1, -1,  1, -1, -1,  1, -1,  1, -1, -1, -1,  1,  1,  1, -1,
+    -1,  1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1, -1, -1,
+    -1, -1, -1, -1,  1,  1,  1,  1, -1,  1, -1,  1,  1, -1, -1,  1,
+    -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1, -1,
+     1,  1,  1, -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1,
+    -1,  1, -1, -1, -1,  1, -1,  1, -1,  1,  1,  1,  1,  1,  1, -1,
+    -1,  1,  1, -1,  1,  1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1,
+     1, -1, -1,  1, -1, -1,  1, -1, -1,  1, -1, -1, -1,  1,  1,  1,
+     1, -1,  1,  1, -1, -1, -1,  1, -1,  1,  1,  1,  1,  1,  1,  1,
+    -1,  1,  1,  1,  1, -1,  1,  1,  1, -1,  1, -1,  1,  1, -1,  1,
+    -1,  1,  1,  1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,  1, -1,
+    -1,  1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1,  1, -1, -1,
+     1,  1, -1, -1,  1,  1, -1, -1,  1,  1,  1,  1,  1,  1,  1,  1,
+     1, -1,  1,  1, -1,  1,  1, -1, -1, -1,  1, -1,  1,  1, -1,  1,
+    -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1,
+     1,  1,  1, -1,  1, -1,  1,  1,  1, -1,  1, -1,  1,  1,  1,  1,
+    -1,  1, -1, -1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1,
+     1, -1, -1,  1,  1,  1, -1, -1, -1,  1, -1,  1, -1,  1,  1,  1,
+    -1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1,  1,
+    -1, -1, -1, -1,  1,  1, -1,  1,  1,  1,  1, -1,  1, -1, -1,  1,
+     1, -1, -1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1,
+    -1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1,  1,
+     1, -1, -1, -1, -1, -1,  1,  1,  1,  1, -1, -1, -1, -1,  1, -1,
+    -1, -1,  1,  1, -1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,
+    -1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1,  1,  1, -1, -1,
+     1, -1, -1, -1, -1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1,
+    -1, -1,  1, -1,  1,  1,  1,  1,  1,  1,  1, -1, -1,  1,  1, -1,
+     1, -1,  1, -1,  1, -1, -1,  1, -1, -1, -1,  1,  1,  1, -1, -1,
+    -1,  1,  1,  1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,  1,
+     1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,  1,
+    -1,  1,  1,  1,  1,  1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,
+    -1, -1,  1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1,  1, -1,  1,
+    -1,  1, -1,  1,  1, -1, -1,  1,  1,  1,  1, -1, -1,  1,  1,  1,
+    -1, -1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1,
+     1, -1,  1, -1,  1, -1,  1,  1,  1, -1, -1, -1, -1, -1, -1,  1,
+    -1,  1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1, -1, -1,
+     1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1, -1,  1,
+};
+
+static void ggml_tq1_0r_1024_fwht(float * GGML_RESTRICT v) {
+    for (int j = 0; j < QK_TQ1_0R_1024; ++j) {
+        v[j] *= 0.03125f; // 1/sqrt(1024)
+    }
+    for (int len = 1; len < QK_TQ1_0R_1024; len <<= 1) {
+        for (int i = 0; i < QK_TQ1_0R_1024; i += 2 * len) {
+            for (int j = 0; j < len; ++j) {
+                const float u = v[i + j];
+                const float w = v[i + len + j];
+                v[i + j]       = u + w;
+                v[i + len + j] = u - w;
+            }
+        }
+    }
+}
+
+static inline void ggml_tq1_0r_1024_apply_sign(float * GGML_RESTRICT v) {
+    for (int j = 0; j < QK_TQ1_0R_1024; ++j) {
+        v[j] *= (float) ggml_tq1_0r_1024_sign[j];
+    }
+}
+
+void ggml_tq1_0r_1024_rotate_act(float * GGML_RESTRICT v) {
+    ggml_tq1_0r_1024_apply_sign(v);
+    ggml_tq1_0r_1024_fwht(v);
+}
+
+// value already divided by its scale -> trit in {0, 1, 2}; values beyond the scale saturate to +-1
+static inline int ggml_tq1_0r_1024_trit(float xn) {
+    long r = lroundf(xn);
+    if (r < -1) r = -1;
+    if (r >  1) r =  1;
+    return (int) r + 1;
+}
+
+// pack 256 normalized values with the block_tq1_0 layout (same loops as quantize_row_tq1_0_ref)
+static void ggml_tq1_0r_1024_pack_quarter(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT qs, uint8_t * GGML_RESTRICT qh) {
+    // 5 elements per byte, along 32 bytes
+    for (size_t m = 0; m < 32; ++m) {
+        uint8_t q = 0;
+        for (size_t n = 0; n < 5; ++n) {
+            q = q * 3 + ggml_tq1_0r_1024_trit(x[m + n*32]);
+        }
+        qs[m] = ((uint16_t)q * 256 + (243 - 1)) / 243;
+    }
+    x += 5*32;
+    // along 16 bytes
+    for (size_t m = 0; m < 16; ++m) {
+        uint8_t q = 0;
+        for (size_t n = 0; n < 5; ++n) {
+            q = q * 3 + ggml_tq1_0r_1024_trit(x[m + n*16]);
+        }
+        qs[32 + m] = ((uint16_t)q * 256 + (243 - 1)) / 243;
+    }
+    x += 5*16;
+    // 4 elements per byte
+    for (size_t j = 0; j < 4; ++j) {
+        uint8_t q = 0;
+        for (size_t m = 0; m < 4; ++m) {
+            q = q * 3 + ggml_tq1_0r_1024_trit(x[j + m*4]);
+        }
+        q *= 3;
+        qh[j] = ((uint16_t)q * 256 + (243 - 1)) / 243;
+    }
+}
+
+// decode 256 trits of a quarter to {-1, 0, +1} (same loops as dequantize_row_tq1_0, without the scale)
+static void ggml_tq1_0r_1024_decode_quarter(const uint8_t * GGML_RESTRICT qs, const uint8_t * GGML_RESTRICT qh, float * GGML_RESTRICT y) {
+    const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    for (size_t n = 0; n < 5; ++n) {
+        for (size_t m = 0; m < 32; ++m) {
+            uint8_t q = qs[m] * pow3[n];
+            int16_t xi = ((uint16_t) q * 3) >> 8;
+            *y++ = (float) (xi - 1);
+        }
+    }
+    for (size_t n = 0; n < 5; ++n) {
+        for (size_t m = 0; m < 16; ++m) {
+            uint8_t q = qs[32 + m] * pow3[n];
+            int16_t xi = ((uint16_t) q * 3) >> 8;
+            *y++ = (float) (xi - 1);
+        }
+    }
+    for (size_t n = 0; n < 4; ++n) {
+        for (size_t j = 0; j < 4; ++j) {
+            uint8_t q = qh[j] * pow3[n];
+            int16_t xi = ((uint16_t) q * 3) >> 8;
+            *y++ = (float) (xi - 1);
+        }
+    }
+}
+
+void quantize_row_tq1_0r_1024_ref(const float * GGML_RESTRICT x, block_tq1_0r_1024 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ1_0R_1024 == 0);
+    const int64_t nb = k / QK_TQ1_0R_1024;
+
+    float tmp[QK_TQ1_0R_1024];
+    for (int64_t i = 0; i < nb; i++) {
+        memcpy(tmp, x + i * QK_TQ1_0R_1024, sizeof(tmp));
+        ggml_tq1_0r_1024_rotate_act(tmp);
+        // One least-squares scale per group of 128: for each threshold t on a small grid (relative to the
+        // mean |w|), the weights with |w| > t become +-1 and d = mean of their |w|; keep the d that maximizes
+        // sum^2/count, i.e. minimizes ||w - d*t||^2. An absmax scale, right for weights that are already
+        // ternary, loses most of the energy of a dense tensor. The sums are done in double on float inputs,
+        // so they are exact and independent of the summation order.
+        for (int g = 0; g < 8; ++g) {
+            const float * w = tmp + g*128;
+            double sum_all = 0.0;
+            for (int j = 0; j < 128; ++j) {
+                sum_all += (double) fabsf(w[j]);
+            }
+            const double mean = sum_all / 128.0;
+            static const double grid[6] = { 0.55, 0.66, 0.76, 0.86, 1.00, 1.20 };
+            double best_score = -1.0;
+            double best_d = 0.0;
+            for (int t = 0; t < 6; ++t) {
+                const double thr = grid[t] * mean;
+                double sum = 0.0;
+                int    cnt = 0;
+                for (int j = 0; j < 128; ++j) {
+                    const double a = (double) fabsf(w[j]);
+                    if (a > thr) { sum += a; cnt++; }
+                }
+                const double score = cnt > 0 ? sum * sum / (double) cnt : 0.0;
+                if (score > best_score) {
+                    best_score = score;
+                    best_d = cnt > 0 ? sum / (double) cnt : 0.0;
+                }
+            }
+            const float d  = (float) best_d;
+            const float id = d ? 1.0f/d : 0.0f;
+            y[i].d[g] = GGML_FP32_TO_FP16(d);
+            for (int j = 0; j < 128; ++j) {
+                tmp[g*128 + j] *= id;
+            }
+        }
+        for (int q = 0; q < 4; ++q) {
+            ggml_tq1_0r_1024_pack_quarter(tmp + q*256, y[i].qs[q], y[i].qh[q]);
+        }
+    }
+}
+
+size_t quantize_tq1_0r_1024(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // not used
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ1_0R_1024, n_per_row);
+    quantize_row_tq1_0r_1024_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+void dequantize_row_tq1_0r_1024(const block_tq1_0r_1024 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ1_0R_1024 == 0);
+    const int64_t nb = k / QK_TQ1_0R_1024;
+    for (int64_t i = 0; i < nb; ++i) {
+        float * yb = y + i * QK_TQ1_0R_1024;
+        for (int q = 0; q < 4; ++q) {
+            ggml_tq1_0r_1024_decode_quarter(x[i].qs[q], x[i].qh[q], yb + q*256);
+        }
+        for (int g = 0; g < 8; ++g) {
+            const float d = GGML_FP16_TO_FP32(x[i].d[g]);
+            for (int j = 0; j < 128; ++j) {
+                yb[g*128 + j] *= d;
+            }
+        }
+        ggml_tq1_0r_1024_fwht(yb);
+        ggml_tq1_0r_1024_apply_sign(yb);
+    }
+}
+
+// ====================== packed multi-plane ternary types
+//
+// A packed block holds K planes of the base block for the same weights (plane p of block b at b*K + p);
+// the weight is the sum of the planes, dequantized in plane order. Quantization from float is a greedy
+// residual chain (plane p quantizes what planes 0..p-1 left); it is a reference path for tests and
+// llama-quantize, models usually ship planes produced by their own quantizer.
+#define GGML_PACKED_PLANES(NAME, BASE, QK, K, TYPE)                                                    \
+void dequantize_row_##NAME(const block_##NAME * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK == 0);                                                                              \
+    const int64_t nb = k / QK;                                                                        \
+    float tmp[QK];                                                                                    \
+    for (int64_t i = 0; i < nb; ++i) {                                                                \
+        float * yb = y + i * QK;                                                                      \
+        dequantize_row_##BASE(&x[i].p[0], yb, QK);                                                    \
+        for (int pl = 1; pl < K; ++pl) {                                                              \
+            dequantize_row_##BASE(&x[i].p[pl], tmp, QK);                                              \
+            for (int j = 0; j < QK; ++j) {                                                            \
+                yb[j] += tmp[j];                                                                      \
+            }                                                                                         \
+        }                                                                                             \
+    }                                                                                                 \
+}                                                                                                     \
+void quantize_row_##NAME##_ref(const float * GGML_RESTRICT x, block_##NAME * GGML_RESTRICT y, int64_t k) { \
+    assert(k % QK == 0);                                                                              \
+    const int64_t nb = k / QK;                                                                        \
+    float res[QK];                                                                                    \
+    float tmp[QK];                                                                                    \
+    for (int64_t i = 0; i < nb; ++i) {                                                                \
+        memcpy(res, x + i * QK, sizeof(res));                                                         \
+        for (int pl = 0; pl < K; ++pl) {                                                              \
+            quantize_row_##BASE##_ref(res, &y[i].p[pl], QK);                                          \
+            dequantize_row_##BASE(&y[i].p[pl], tmp, QK);                                              \
+            for (int j = 0; j < QK; ++j) {                                                            \
+                res[j] -= tmp[j];                                                                     \
+            }                                                                                         \
+        }                                                                                             \
+    }                                                                                                 \
+}                                                                                                     \
+size_t quantize_##NAME(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow,       \
+                       int64_t n_per_row, const float * quant_weights) {                              \
+    (void) quant_weights;                                                                             \
+    quantize_row_##NAME##_ref(src, dst, nrow * n_per_row);                                            \
+    return nrow * ggml_row_size(TYPE, n_per_row);                                                     \
+}
+
+GGML_PACKED_PLANES(tq1_0r_1024_x2, tq1_0r_1024, QK_TQ1_0R_1024, 2, GGML_TYPE_TQ1_0R_1024_X2)
+GGML_PACKED_PLANES(tq1_0r_1024_x3, tq1_0r_1024, QK_TQ1_0R_1024, 3, GGML_TYPE_TQ1_0R_1024_X3)
+GGML_PACKED_PLANES(tq1_0r_1024_x4, tq1_0r_1024, QK_TQ1_0R_1024, 4, GGML_TYPE_TQ1_0R_1024_X4)
+GGML_PACKED_PLANES(tq1_0_x2,       tq1_0,       QK_K,           2, GGML_TYPE_TQ1_0_X2)
+GGML_PACKED_PLANES(tq1_0_x3,       tq1_0,       QK_K,           3, GGML_TYPE_TQ1_0_X3)
+GGML_PACKED_PLANES(tq1_0_x4,       tq1_0,       QK_K,           4, GGML_TYPE_TQ1_0_X4)
+#undef GGML_PACKED_PLANES
+
 void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
@@ -5601,6 +5903,29 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TQ1_0R_1024:
+        case GGML_TYPE_TQ1_0R_1024_X2:
+        case GGML_TYPE_TQ1_0R_1024_X3:
+        case GGML_TYPE_TQ1_0R_1024_X4:
+            {
+                // nb * K base blocks back to back, 8 fp16 scales each
+                const block_tq1_0r_1024 * q = (const block_tq1_0r_1024 *) data;
+                const size_t nsub = nb * (ggml_type_size(type) / sizeof(block_tq1_0r_1024));
+                for (size_t i = 0; i < nsub; ++i) {
+                    for (int g = 0; g < 8; ++g) {
+                        if (!validate_fp16(q[i].d[g], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
+        case GGML_TYPE_TQ1_0_X2:
+        case GGML_TYPE_TQ1_0_X3:
+        case GGML_TYPE_TQ1_0_X4:
+            {
+                const size_t nsub = nb * (ggml_type_size(type) / sizeof(block_tq1_0));
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq1_0, data, nsub);
             } break;
         case GGML_TYPE_IQ1_S:
             {

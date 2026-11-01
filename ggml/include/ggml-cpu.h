@@ -119,6 +119,10 @@ extern "C" {
         ggml_vec_dot_t           vec_dot;
         enum ggml_type           vec_dot_type;
         int64_t                  nrows; // number of rows to process simultaneously
+        // optional: converts the activations to vec_dot_type for types whose vec_dot expects transformed
+        // activations (e.g. rotated per weight block); works on whole blocks of this type.
+        // NULL means the from_float of vec_dot_type is used.
+        ggml_from_float_t        from_float_act;
     };
 
     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
