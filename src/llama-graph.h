@@ -1018,6 +1018,17 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// optional residual plane of the routed experts, on a subset of the experts:
+// W_e += W2[map[e]] for every expert e with map[e] >= 0; a null map means that W2 covers all the experts
+struct llm_moe_exps2 {
+    ggml_tensor * up       = nullptr; // [n_embd, n_ff,   n_slots]
+    ggml_tensor * gate     = nullptr; // [n_embd, n_ff,   n_slots]
+    ggml_tensor * down     = nullptr; // [n_ff,   n_embd, n_slots]
+    ggml_tensor * up_map   = nullptr; // F32 [1, n_expert]: slot of each expert, -1 = none
+    ggml_tensor * gate_map = nullptr;
+    ggml_tensor * down_map = nullptr;
+};
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1195,7 +1206,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+     const llm_moe_exps2 * exps2 = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1223,7 +1235,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+     const llm_moe_exps2 * exps2 = nullptr) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(

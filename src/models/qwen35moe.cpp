@@ -95,6 +95,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        create_tensor_exps2(layer, il, n_embd, n_ff_exp, n_expert, flags);
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
@@ -489,6 +490,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    const auto & layer = model.layers[il];
+    llm_moe_exps2 exps2;
+    exps2.up       = layer.ffn_up_exps2;
+    exps2.gate     = layer.ffn_gate_exps2;
+    exps2.down     = layer.ffn_down_exps2;
+    exps2.up_map   = layer.ffn_up_exps2_map;
+    exps2.gate_map = layer.ffn_gate_exps2_map;
+    exps2.down_map = layer.ffn_down_exps2_map;
+    const bool has_exps2 = exps2.up || exps2.gate || exps2.down;
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -503,7 +514,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr, nullptr, 1e-5f,
+            has_exps2 ? &exps2 : nullptr);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation

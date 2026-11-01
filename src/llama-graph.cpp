@@ -2101,7 +2101,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+ const llm_moe_exps2 * exps2) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2124,7 +2125,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        exps2
     );
 }
 
@@ -2154,7 +2156,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+ const llm_moe_exps2 * exps2) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2302,6 +2305,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
+    // residual plane of the experts: y += mask * W2[ids2] x, with s = map[id] (-1 = no plane for that expert),
+    // mask = step(s + 0.5) and ids2 = s * mask, so that experts without a plane read slot 0 and are zeroed
+    auto build_exps2 = [&](ggml_tensor * y, ggml_tensor * w2, ggml_tensor * map, ggml_tensor * x) -> ggml_tensor * {
+        if (map == nullptr) {
+            GGML_ASSERT(w2->ne[2] == n_expert);
+            return ggml_add(ctx0, y, build_lora_mm_id(w2, x, selected_experts, nullptr));
+        }
+        const int64_t n_used = selected_experts->ne[0];
+        const int64_t n_tok  = selected_experts->ne[1];
+        ggml_tensor * map_t = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, map, 1, n_expert, 1), 1, n_expert, n_tok, 1);
+        ggml_tensor * s     = ggml_get_rows(ctx0, map_t, selected_experts);                  // [1, n_used, n_tok]
+        ggml_tensor * mask  = ggml_step(ctx0, ggml_scale_bias(ctx0, s, 1.0f, 0.5f));         // [1, n_used, n_tok]
+        ggml_tensor * ids2  = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_mul(ctx0, s, mask), n_used, n_tok), GGML_TYPE_I32);
+        return ggml_add(ctx0, y, ggml_mul(ctx0, build_lora_mm_id(w2, x, ids2, nullptr), mask));
+    };
+    GGML_ASSERT(!(gate_up_exps && exps2 && (exps2->up || exps2->gate)) && "residual expert planes need separate gate and up experts");
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2338,6 +2358,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
+        if (exps2 && exps2->up) {
+            up = build_exps2(up, exps2->up, exps2->up_map, cur);
+            cb(up, "ffn_moe_up_exps2", il);
+        }
+
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
         }
@@ -2348,8 +2373,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
+            ggml_tensor * gate_in = cur;
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
+
+            if (exps2 && exps2->gate) {
+                cur = build_exps2(cur, exps2->gate, exps2->gate_map, gate_in);
+                cb(cur, "ffn_moe_gate_exps2", il);
+            }
         } else {
             cur = up;
         }
@@ -2464,6 +2495,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
+
+        if (exps2 && exps2->down) {
+            experts = build_exps2(experts, exps2->down, exps2->down_map, cur);
+            cb(experts, "ffn_moe_down_exps2", il);
+        }
 
         if (amax_src1.scale_s) {
             experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
