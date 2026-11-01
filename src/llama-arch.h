@@ -555,6 +555,12 @@ enum llm_tensor {
     LLM_TENSOR_FFN_GATE_EXPS,
     LLM_TENSOR_FFN_UP_EXPS,
     LLM_TENSOR_FFN_GATE_UP_EXPS,
+    LLM_TENSOR_FFN_DOWN_EXPS2,    // residual plane of the merged experts, on a subset of the experts
+    LLM_TENSOR_FFN_GATE_EXPS2,
+    LLM_TENSOR_FFN_UP_EXPS2,
+    LLM_TENSOR_FFN_DOWN_EXPS2_MAP, // expert -> slot in the residual plane (-1 = none)
+    LLM_TENSOR_FFN_GATE_EXPS2_MAP,
+    LLM_TENSOR_FFN_UP_EXPS2_MAP,
     LLM_TENSOR_FFN_DOWN_SHEXP,
     LLM_TENSOR_FFN_GATE_SHEXP,
     LLM_TENSOR_FFN_UP_SHEXP,

@@ -3920,6 +3920,48 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
     }
 }
 
+void llama_model_base::create_tensor_exps2(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+    const int opt = TENSOR_NOT_REQUIRED | (flags & TENSOR_SKIP);
+
+    auto load = [&](llm_tensor t_w, llm_tensor t_map, int64_t ne0, int64_t ne1, ggml_tensor *& w, ggml_tensor *& map) {
+        const std::string name_w   = tn(t_w, "weight", bid).str();
+        const std::string name_map = tn(t_map, bid).str();
+
+        const ggml_tensor * meta_w   = ml->get_tensor_meta(name_w.c_str());
+        const ggml_tensor * meta_map = ml->get_tensor_meta(name_map.c_str());
+
+        if (meta_w == nullptr) {
+            if (meta_map != nullptr) {
+                throw std::runtime_error(format("%s: found without %s", name_map.c_str(), name_w.c_str()));
+            }
+            return;
+        }
+
+        const int64_t n_slots = meta_w->ne[2];
+        if (n_slots < 1 || n_slots > n_expert_) {
+            throw std::runtime_error(format("%s: %lld slots, expected 1..%lld", name_w.c_str(), (long long) n_slots, (long long) n_expert_));
+        }
+        if (meta_map == nullptr && n_slots != n_expert_) {
+            throw std::runtime_error(format("%s: covers %lld of %lld experts but %s is missing",
+                        name_w.c_str(), (long long) n_slots, (long long) n_expert_, name_map.c_str()));
+        }
+        if (meta_map != nullptr && meta_map->type != GGML_TYPE_F32) {
+            throw std::runtime_error(format("%s: expected type f32, got %s", name_map.c_str(), ggml_type_name(meta_map->type)));
+        }
+
+        ggml_tensor * t  = create_tensor(tn(t_w, "weight", bid), {ne0, ne1, n_slots}, opt);
+        ggml_tensor * tm = meta_map ? create_tensor(tn(t_map, bid), {1, n_expert_}, opt) : nullptr;
+        if (!(flags & TENSOR_SKIP)) {
+            w   = t;
+            map = tm;
+        }
+    };
+
+    load(LLM_TENSOR_FFN_GATE_EXPS2, LLM_TENSOR_FFN_GATE_EXPS2_MAP, n_embd_, n_ff_,   layer.ffn_gate_exps2, layer.ffn_gate_exps2_map);
+    load(LLM_TENSOR_FFN_UP_EXPS2,   LLM_TENSOR_FFN_UP_EXPS2_MAP,   n_embd_, n_ff_,   layer.ffn_up_exps2,   layer.ffn_up_exps2_map);
+    load(LLM_TENSOR_FFN_DOWN_EXPS2, LLM_TENSOR_FFN_DOWN_EXPS2_MAP, n_ff_,   n_embd_, layer.ffn_down_exps2, layer.ffn_down_exps2_map);
+}
+
 void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
         int flags) {

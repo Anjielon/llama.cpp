@@ -357,6 +357,14 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_b     = nullptr;
     struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
 
+    // ff MoE residual plane on a subset of the experts: W_e = W_e + W2[map[e]] when map[e] >= 0
+    struct ggml_tensor * ffn_gate_exps2     = nullptr;
+    struct ggml_tensor * ffn_down_exps2     = nullptr;
+    struct ggml_tensor * ffn_up_exps2       = nullptr;
+    struct ggml_tensor * ffn_gate_exps2_map = nullptr;
+    struct ggml_tensor * ffn_down_exps2_map = nullptr;
+    struct ggml_tensor * ffn_up_exps2_map   = nullptr;
+
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
@@ -982,6 +990,11 @@ struct llama_model_base : public llama_model {
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
+                int64_t n_ff_, int64_t n_expert_, int flags);
+
+    // helper: optional residual planes of the routed experts (ffn_*_exps2) with their expert -> slot maps
+    // (ffn_*_exps2_map); the number of slots is read from the file
+    void create_tensor_exps2(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
