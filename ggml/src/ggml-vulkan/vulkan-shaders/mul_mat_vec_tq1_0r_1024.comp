@@ -1,0 +1,113 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+#include "mul_mat_vec_base.glsl"
+#include "tq1_0r_1024_common.glsl"
+
+// Mat-vec of TQ1_0R_1024 (and its packed planes) against an activation already rotated by
+// rot_y_tq1_0r_1024.comp: the weights are decoded without rotation (trit x d[g]), since
+// dot(S H (d * t), y) == dot(d * t, (1/32) H (S * y)).
+//
+// The unit of work is one 32-bit word of a block (52 useful words per 224-byte block: 48 of qs and 4 of qh;
+// the 4 words of the scales are read separately). For each digit t the 4 bytes of a word cover 4 consecutive
+// elements, so the activation is read as vec4, once per word, and reused for all the NUM_ROWS rows.
+// trit = x - 1 with x in {0, 1, 2}: dot(x - 1, y) = dot(x, y) - sum(y), with the sum computed per word.
+// Scales: word ws is in quarter q = ws / 13; in the first chunk (r < 8) digits t < 4 belong to group 2q and
+// t = 4 to group 2q + 1, everything else belongs to group 2q + 1.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer AW {uint data_aw[];};
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+const uint TQ1R_WORDS = 56u; // 224 bytes per block
+
+// contribution of one word of one plane: w = 4 bytes of trits, dw = d[2q] | d[2q + 1] << 16
+float plane_acc(const uint w, const uint dw, const bool c1,
+                const vec4 y0, const vec4 y1, const vec4 y2, const vec4 y3, const vec4 y4,
+                const float s0, const float s1, const float s2, const float s3, const float s4) {
+    const vec2 dd = unpackHalf2x16(dw);
+    vec4 x0, x1, x2, x3, x4;
+    tq1_swar_digits(w, x0, x1, x2, x3, x4);
+    const float t0 = dot(x0, y0) - s0;
+    const float t1 = dot(x1, y1) - s1;
+    const float t2 = dot(x2, y2) - s2;
+    const float t3 = dot(x3, y3) - s3;
+    const float t4 = dot(x4, y4) - s4; // y4 = 0 for qh
+    const float lo = t0 + t1 + t2 + t3;
+    return c1 ? (dd.x * lo + dd.y * t4) : (dd.y * (lo + t4));
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint nb = p.ncols / 1024u;
+    const uint tid = gl_LocalInvocationID.x;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    const uint nws = nb * 52u;
+    for (uint f = tid; f < nws; f += BLOCK_SIZE) {
+        const uint blk = f / 52u;
+        const uint ws  = f - blk * 52u;
+        const uint q   = ws / 13u;
+        const uint r   = ws - q * 13u;
+        const bool c1   = r < 8u;  // first chunk
+        const bool has5 = r < 12u; // qs (5 digits) or qh (4 digits)
+        const uint wword = has5 ? (q * 12u + r) : (48u + q);
+        const uint e0    = c1 ? (q * 256u + 4u * r) : (has5 ? (q * 256u + 160u + 4u * (r - 8u)) : (q * 256u + 240u));
+        const uint estep = c1 ? 8u : (has5 ? 4u : 1u); // step between digits in vec4 units (32/16/4 elements)
+
+        [[unroll]] for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
+            const uint yb = (jcol * p.batch_stride_b + b_offset + blk * 1024u + e0) >> 2;
+            const vec4 y0 = vec4(data_b_v4[yb]);
+            const vec4 y1 = vec4(data_b_v4[yb + estep]);
+            const vec4 y2 = vec4(data_b_v4[yb + 2u * estep]);
+            const vec4 y3 = vec4(data_b_v4[yb + 3u * estep]);
+            vec4 y4 = vec4(0.0);
+            if (has5) {
+                y4 = vec4(data_b_v4[yb + 4u * estep]);
+            }
+            const float s0 = y0.x + y0.y + y0.z + y0.w;
+            const float s1 = y1.x + y1.y + y1.z + y1.w;
+            const float s2 = y2.x + y2.y + y2.z + y2.w;
+            const float s3 = y3.x + y3.y + y3.z + y3.w;
+            const float s4 = y4.x + y4.y + y4.z + y4.w;
+
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n >= num_rows) {
+                    break;
+                }
+                // packed planes of one block are consecutive base blocks
+                const uint wb = ((a_offset + (first_row + n) * nb + blk) * PACKED_K) * TQ1R_WORDS;
+                float acc = 0.0;
+                [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+                    acc += plane_acc(data_aw[wb + pk * TQ1R_WORDS + wword], data_aw[wb + pk * TQ1R_WORDS + 52u + q],
+                                     c1, y0, y1, y2, y3, y4, s0, s1, s2, s3, s4);
+                }
+                temp[jcol][n] += FLOAT_TYPE(acc);
+            }
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

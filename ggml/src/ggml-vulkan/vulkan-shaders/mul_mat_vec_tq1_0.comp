@@ -27,41 +27,45 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
             const uint b_base = (jcol * p.batch_stride_b);
             for (uint i = tid/8; i < num_blocks_per_row; i += gl_WorkGroupSize.x/8) {
-                const FLOAT_TYPE d = float(data_a[ib0 + i].d);
+                // packed planes (PACKED_K > 1): plane pk of block i is base block (ib0 + i)*PACKED_K + pk
+                [[unroll]] for (uint pk = 0; pk < PACKED_K; ++pk) {
+                    const uint ib = (ib0 + i) * PACKED_K + pk;
+                    const FLOAT_TYPE d = float(data_a[ib].d);
 
-                // First qs chunk: 32 bytes (5*32 elements)
-                [[unroll]] for (uint m = tid%8; m < 32; m += 8) {
-                    const uint q_byte = uint(data_a[ib0 + i].qs[m]);
-                    [[unroll]] for (uint t = 0; t < 5; ++t) {
-                        const uint xi = tq1_0_trit(q_byte, t);
-                        const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(xi) - 1.0f));
-                        const uint elem = t * 32u + m;
-                        const uint b_idx = i * QUANT_K + elem;
-                        temp[jcol][nrow] += dequant_val * FLOAT_TYPE(data_b[b_base + b_offset + b_idx]);
+                    // First qs chunk: 32 bytes (5*32 elements)
+                    [[unroll]] for (uint m = tid%8; m < 32; m += 8) {
+                        const uint q_byte = uint(data_a[ib].qs[m]);
+                        [[unroll]] for (uint t = 0; t < 5; ++t) {
+                            const uint xi = tq1_0_trit(q_byte, t);
+                            const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(xi) - 1.0f));
+                            const uint elem = t * 32u + m;
+                            const uint b_idx = i * QUANT_K + elem;
+                            temp[jcol][nrow] += dequant_val * FLOAT_TYPE(data_b[b_base + b_offset + b_idx]);
+                        }
                     }
-                }
 
-                // Second qs chunk: 16 bytes (5*16 elements)
-                [[unroll]] for (uint m = tid%8; m < 16; m += 8) {
-                    const uint q_byte = uint(data_a[ib0 + i].qs[32u + m]);
-                    [[unroll]] for (uint t = 0; t < 5; ++t) {
-                        const uint xi = tq1_0_trit(q_byte, t);
-                        const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(xi) - 1.0f));
-                        const uint elem = 160u + t * 16u + m;
-                        const uint b_idx = i * QUANT_K + elem;
-                        temp[jcol][nrow] += dequant_val * FLOAT_TYPE(data_b[b_base + b_offset + b_idx]);
+                    // Second qs chunk: 16 bytes (5*16 elements)
+                    [[unroll]] for (uint m = tid%8; m < 16; m += 8) {
+                        const uint q_byte = uint(data_a[ib].qs[32u + m]);
+                        [[unroll]] for (uint t = 0; t < 5; ++t) {
+                            const uint xi = tq1_0_trit(q_byte, t);
+                            const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(xi) - 1.0f));
+                            const uint elem = 160u + t * 16u + m;
+                            const uint b_idx = i * QUANT_K + elem;
+                            temp[jcol][nrow] += dequant_val * FLOAT_TYPE(data_b[b_base + b_offset + b_idx]);
+                        }
                     }
-                }
 
-                // qh bytes: 4 bytes (4*4 elements)
-                [[unroll]] for (uint j = tid%8; j < 4; j += 8) {
-                    const uint qh_byte = uint(data_a[ib0 + i].qh[j]);
-                    [[unroll]] for (uint t = 0; t < 4; ++t) {
-                        const uint xi = tq1_0_trit(qh_byte, t);
-                        const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(xi) - 1.0f));
-                        const uint elem = 240u + t * 4u + j;
-                        const uint b_idx = i * QUANT_K + elem;
-                        temp[jcol][nrow] += dequant_val * FLOAT_TYPE(data_b[b_base + b_offset + b_idx]);
+                    // qh bytes: 4 bytes (4*4 elements)
+                    [[unroll]] for (uint j = tid%8; j < 4; j += 8) {
+                        const uint qh_byte = uint(data_a[ib].qh[j]);
+                        [[unroll]] for (uint t = 0; t < 4; ++t) {
+                            const uint xi = tq1_0_trit(qh_byte, t);
+                            const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(xi) - 1.0f));
+                            const uint elem = 240u + t * 4u + j;
+                            const uint b_idx = i * QUANT_K + elem;
+                            temp[jcol][nrow] += dequant_val * FLOAT_TYPE(data_b[b_base + b_offset + b_idx]);
+                        }
                     }
                 }
             }

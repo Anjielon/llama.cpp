@@ -616,11 +616,69 @@ float tq1_0_val(uint ib, uint e, uint a_offset) {
                                        : data_a[a_offset + ib].qh[bidx - 48u]);
     return float(tq1_0_trit(qbyte, tq1_0_digit_of(e))) - 1.0;
 }
+#if PACKED_K == 1
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     return vec2(tq1_0_val(ib, iqs, a_offset), tq1_0_val(ib, iqs + 1u, a_offset));
 }
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
+}
+#else
+// packed planes: plane k of packed block ib is base block ib*PACKED_K + k, each with its own scale
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    vec2 v = vec2(0.0);
+    [[unroll]] for (uint k = 0u; k < PACKED_K; ++k) {
+        const uint sb = (a_offset + ib) * PACKED_K + k;
+        v += float(data_a[sb].d) * vec2(tq1_0_val(sb, iqs, 0u), tq1_0_val(sb, iqs + 1u, 0u));
+    }
+    return v;
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(1, 0);
+}
+#endif
+#endif
+
+#if defined(DATA_A_TQ1_0R_1024)
+#include "tq1_0r_1024_common.glsl"
+// Closed form of the de-rotation for the pair (iqs, iqs + 1), iqs even:
+// w[e] = S[e] * (1/32) * sum_k H[e, k] d[k >> 7] t[k]. Since H[e + 1, k] = H[e, k] * (-1)^(k & 1),
+// one pass accumulates the even (A) and odd (B) terms: w[e] ~ A + B, w[e + 1] ~ A - B.
+vec2 dequantize_tq1_0r_1024_plane(uint ib, uint iqs) {
+    const uint e0 = iqs & ~1u;
+    float acc_a = 0.0;
+    float acc_b = 0.0;
+    for (uint g = 0u; g < 8u; ++g) {
+        const float d = float(data_a[ib].d[g]);
+        float pa = 0.0;
+        float pb = 0.0;
+        for (uint k = g * 128u; k < (g + 1u) * 128u; k += 2u) {
+            uint bi0; bool qh0; uint t0;
+            tq1_0r_1024_locate(k, bi0, qh0, t0);
+            const uint qb0 = qh0 ? uint(data_a[ib].qh[bi0]) : uint(data_a[ib].qs[bi0]);
+            uint bi1; bool qh1; uint t1;
+            tq1_0r_1024_locate(k + 1u, bi1, qh1, t1);
+            const uint qb1 = qh1 ? uint(data_a[ib].qh[bi1]) : uint(data_a[ib].qs[bi1]);
+            const float hs = tq1_0r_1024_hsign(e0, k);
+            pa += hs * tq1_0r_1024_trit(qb0, t0);
+            pb += hs * tq1_0r_1024_trit(qb1, t1);
+        }
+        acc_a += d * pa;
+        acc_b += d * pb;
+    }
+    const float s0 = tq1_0r_1024_sign(e0) * 0.03125;
+    const float s1 = tq1_0r_1024_sign(e0 + 1u) * 0.03125;
+    return vec2(s0 * (acc_a + acc_b), s1 * (acc_a - acc_b));
+}
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    vec2 v = vec2(0.0);
+    [[unroll]] for (uint k = 0u; k < PACKED_K; ++k) {
+        v += dequantize_tq1_0r_1024_plane((a_offset + ib) * PACKED_K + k, iqs);
+    }
+    return v;
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(1, 0);
 }
 #endif
 

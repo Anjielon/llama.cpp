@@ -77,6 +77,18 @@ const std::vector<std::string> type_names = {
     "bf16",
 };
 
+// TQ1_0R_1024 and the packed multi-plane ternary types: only mat-vec, dequant and get_rows shaders are
+// built for them (mat-mat goes through dequant to f16)
+const std::vector<std::string> tq_plane_type_names = {
+    "tq1_0r_1024",
+    "tq1_0r_1024_x2",
+    "tq1_0r_1024_x3",
+    "tq1_0r_1024_x4",
+    "tq1_0_x2",
+    "tq1_0_x3",
+    "tq1_0_x4",
+};
+
 enum MatMulIdType {
     NONE,
     DEFAULT,
@@ -844,6 +856,28 @@ void process_shaders() {
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
     }
 
+    for (const auto& tname : tq_plane_type_names) {
+        const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+        const bool r1024 = string_starts_with(tname, "tq1_0r_1024");
+        const std::string mmv = r1024 ? "mul_mat_vec_tq1_0r_1024.comp" : "mul_mat_vec_tq1_0.comp";
+        const std::map<std::string, std::string> mmv_dict = merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
+        for (const std::string pfx : {"mul_mat_vec_", "mul_mat_vec_id_"}) {
+            const std::map<std::string, std::string> d = pfx == std::string("mul_mat_vec_id_") ? merge_maps(mmv_dict, {{"MUL_MAT_ID", "1"}}) : mmv_dict;
+            string_to_spv(pfx + tname + "_f32_f32", mmv, d);
+            string_to_spv(pfx + tname + "_f32_f32_subgroup", mmv, merge_maps(d, {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv(pfx + tname + "_f32_f32_subgroup_no_shmem", mmv, merge_maps(d, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
+        if (r1024) {
+            string_to_spv("dequant_" + tname, "dequant_tq1_0r_1024.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
+        } else {
+            string_to_spv("dequant_" + tname, "dequant_tq1_0.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"TQ1_0_DEQUANT_ITERS", "16"}}));
+        }
+        string_to_spv("get_rows_" + tname, "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
+        string_to_spv("get_rows_" + tname + "_f32", "get_rows_quant.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+    }
+    // activation rotation of the TQ1_0R_1024 types
+    string_to_spv("rot_y_tq1_0r_1024_f32", "rot_y_tq1_0r_1024.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
@@ -1333,6 +1367,19 @@ void write_output_files() {
         }
         src << data.str();
         src << len.str();
+    }
+
+    for (const auto& tname : tq_plane_type_names) {
+        for (const std::string pfx : {"", "id_"}) {
+            const std::string arr = "arr_dmmv_" + pfx + tname + "_f32_f32";
+            const std::string nm  = "mul_mat_vec_" + pfx + tname + "_f32_f32";
+            hdr << "extern const void * " << arr << "_data[3];\n";
+            hdr << "extern const uint64_t " << arr << "_len[3];\n";
+            if (basename(input_filepath) == "mul_mat_vec.comp") {
+                src << "const void * " << arr << "_data[3] = {" << nm << "_data, " << nm << "_subgroup_data, " << nm << "_subgroup_no_shmem_data};\n";
+                src << "const uint64_t " << arr << "_len[3] = {" << nm << "_len, " << nm << "_subgroup_len, " << nm << "_subgroup_no_shmem_len};\n";
+            }
+        }
     }
 
     std::vector<std::string> btypes = {"f16", "f32"};

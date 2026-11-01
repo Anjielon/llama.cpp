@@ -1,0 +1,53 @@
+#version 450
+
+#include "dequant_head.glsl"
+#include "tq1_0r_1024_common.glsl"
+
+// TQ1_0R_1024 (and its packed planes) to f16/f32: w = S * (1/32) H (sum over planes of d * t). Each
+// workgroup decodes TQ1R_BLOCKS_PER_WG blocks of 1024, one at a time, with a radix-2 FWHT in shared memory.
+
+#define TQ1R_BLOCKS_PER_WG 16
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_tq1_0r_1024 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+shared float sh[1024];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint nblk = p.nel / 1024u;
+    const uint blk0 = gl_WorkGroupID.x * TQ1R_BLOCKS_PER_WG;
+
+    for (uint blk = blk0; blk < min(blk0 + TQ1R_BLOCKS_PER_WG, nblk); ++blk) {
+        for (uint e = tid; e < 1024u; e += 256u) {
+            uint bi; bool in_qh; uint t;
+            tq1_0r_1024_locate(e, bi, in_qh, t);
+            float v = 0.0;
+            [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+                const uint ib = blk * PACKED_K + pk;
+                const uint qb = in_qh ? uint(data_a[ib].qh[bi]) : uint(data_a[ib].qs[bi]);
+                v += float(data_a[ib].d[e >> 7]) * tq1_0r_1024_trit(qb, t);
+            }
+            sh[e] = v * 0.03125; // 1/sqrt(1024)
+        }
+        barrier();
+        for (uint s = 0u; s < 10u; ++s) {
+            const uint len = 1u << s;
+            for (uint pi = tid; pi < 512u; pi += 256u) {
+                const uint i = ((pi >> s) << (s + 1u)) | (pi & (len - 1u));
+                const uint j = i | len;
+                const float u = sh[i];
+                const float w = sh[j];
+                sh[i] = u + w;
+                sh[j] = u - w;
+            }
+            barrier();
+        }
+        for (uint e = tid; e < 1024u; e += 256u) {
+            data_b[blk * 1024u + e] = D_TYPE(tq1_0r_1024_sign(e) * sh[e]);
+        }
+        barrier();
+    }
+}
