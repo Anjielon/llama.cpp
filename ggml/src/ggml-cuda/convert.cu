@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "tq1r.cuh"
 
 #include <cstdint>
 
@@ -273,6 +274,19 @@ static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * 
         const bool need_check = true;
         dequantize_block_q8_0_f16<need_check><<<num_blocks, WARP_SIZE, 0, stream>>>(vx, y, k);
     }
+}
+
+// TQ1_0 and its packed multi-plane variants (trit x d summed over the K planes, 64 threads per super-block)
+template<int K, typename dst_t>
+static __global__ void dequantize_block_tq1_0_xk(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+    dequantize_tq1_0_xk<K>(vx, i, yy + i*QK_K, threadIdx.x);
+}
+
+template<int K, typename dst_t>
+static void dequantize_row_tq1_0_xk_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_tq1_0_xk<K><<<nb, 64, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
@@ -605,6 +619,19 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TQ1_0:
+            return dequantize_row_tq1_0_xk_cuda<1>;
+        case GGML_TYPE_TQ1_0_X2:
+            return dequantize_row_tq1_0_xk_cuda<2>;
+        case GGML_TYPE_TQ1_0_X3:
+            return dequantize_row_tq1_0_xk_cuda<3>;
+        case GGML_TYPE_TQ1_0_X4:
+            return dequantize_row_tq1_0_xk_cuda<4>;
+        case GGML_TYPE_TQ1_0R_1024:
+        case GGML_TYPE_TQ1_0R_1024_X2:
+        case GGML_TYPE_TQ1_0R_1024_X3:
+        case GGML_TYPE_TQ1_0R_1024_X4:
+            return ggml_cuda_tq1r_get_to_fp16(type);
         default:
             return nullptr;
     }
@@ -662,6 +689,19 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TQ1_0:
+            return dequantize_row_tq1_0_xk_cuda<1>;
+        case GGML_TYPE_TQ1_0_X2:
+            return dequantize_row_tq1_0_xk_cuda<2>;
+        case GGML_TYPE_TQ1_0_X3:
+            return dequantize_row_tq1_0_xk_cuda<3>;
+        case GGML_TYPE_TQ1_0_X4:
+            return dequantize_row_tq1_0_xk_cuda<4>;
+        case GGML_TYPE_TQ1_0R_1024:
+        case GGML_TYPE_TQ1_0R_1024_X2:
+        case GGML_TYPE_TQ1_0R_1024_X3:
+        case GGML_TYPE_TQ1_0R_1024_X4:
+            return ggml_cuda_tq1r_get_to_fp32(type);
         default:
             return nullptr;
     }

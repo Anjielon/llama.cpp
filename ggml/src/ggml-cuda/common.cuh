@@ -1167,6 +1167,40 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ4_XS> {
     static constexpr int bs = sizeof(block_iq4_xs);
 };
 
+// TQ1_0 and its packed multi-plane variants in MMVQ: 8 chunks of 32 elements (one q8_1 block each) per
+// 256-element super-block; the K planes of a packed block are dotted with the same q8_1 blocks.
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ1_0> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = 8;
+    static constexpr int qi = 8;
+    static constexpr int bs = sizeof(block_tq1_0);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ1_0_X2> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = 8;
+    static constexpr int qi = 8;
+    static constexpr int bs = sizeof(block_tq1_0_x2);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ1_0_X3> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = 8;
+    static constexpr int qi = 8;
+    static constexpr int bs = sizeof(block_tq1_0_x3);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ1_0_X4> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = 8;
+    static constexpr int qi = 8;
+    static constexpr int bs = sizeof(block_tq1_0_x4);
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qk = QK_K;

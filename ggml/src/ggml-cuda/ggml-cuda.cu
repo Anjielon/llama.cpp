@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
+#include "ggml-cuda/tq1r.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1979,6 +1980,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
+    // the TQ1_0R_1024 family has its own rotated int8 mat-vec (tq1r.cu), not the MMVQ templates
+    if (ggml_cuda_tq_is_r1024(src0->type)) {
+        return false;
+    }
+
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (cc <= GGML_CUDA_CC_PASCAL) {
@@ -2116,6 +2122,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // ternary types (tq1r.cu): the TQ1_0R_1024 family always takes its own path (rotated activation: int8
+    // mat-vec for ne11 <= 8, fp32-accumulated GEMM otherwise); the TQ1_0 family uses MMVQ for ne11 <= 8 and the
+    // fp32-accumulated plain-decode GEMM for larger batches (one GEMM per plane, every plane exact in fp16).
+    if (ggml_cuda_tq_is_r1024(src0->type)) {
+        ggml_cuda_mul_mat_tq1r(ctx, src0, src1, nullptr, dst, /*force_batch =*/ false);
+        return;
+    }
+    if (ggml_cuda_tq_is_tq1_0(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ne11 > MMVQ_MAX_BATCH_SIZE) {
+        ggml_cuda_mul_mat_tq_batch(ctx, src0, src1, dst);
+        return;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
@@ -2176,6 +2195,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
+    if (ggml_cuda_tq_is_r1024(src0->type)) { // int8 mat-vec id up to TQ1R_MMID_MAX_BATCH tokens
+        return dst->ne[2] > TQ1R_MMID_MAX_BATCH;
+    }
+
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
@@ -2209,6 +2232,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    // TQ1_0R_1024 family experts, few tokens -> rotated int8 mat-vec per (token, slot)
+    if (ggml_cuda_tq_is_r1024(src0->type) && ne2 <= TQ1R_MMID_MAX_BATCH) {
+        ggml_cuda_mul_mat_tq1r(ctx, src0, src1, ids, dst, /*force_batch =*/ false);
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2345,7 +2374,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
         dst_slice.data   = dst_data_cur;
 
-        ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+        if (ggml_cuda_tq_planes(src0->type) > 0) {
+            // ternary types: batched experts take the GEMM path for every expert, also when one expert
+            // receives <= 8 tokens
+            ggml_cuda_mul_mat_tq_batch(ctx, &src0_slice, &src1_slice, &dst_slice);
+        } else {
+            ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         src1_data_cur += src1_slice.nb[2];
@@ -5838,6 +5873,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
 #endif // GGML_USE_MUSA
+                if (ggml_cuda_tq_planes(a->type) > 0) { // ternary types (MMVQ / tq1r.cu)
+                    return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && a->ne[0] % ggml_blck_size(a->type) == 0;
+                }
                 switch (a->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -5899,6 +5937,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ3_S:
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
+                    case GGML_TYPE_TQ1_0:
+                    case GGML_TYPE_TQ1_0_X2:
+                    case GGML_TYPE_TQ1_0_X3:
+                    case GGML_TYPE_TQ1_0_X4:
+                    case GGML_TYPE_TQ1_0R_1024:
+                    case GGML_TYPE_TQ1_0R_1024_X2:
+                    case GGML_TYPE_TQ1_0R_1024_X3:
+                    case GGML_TYPE_TQ1_0R_1024_X4:
                     case GGML_TYPE_IQ4_XS:
                         return true;
                     case GGML_TYPE_IQ4_NL:
