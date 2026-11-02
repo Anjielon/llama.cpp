@@ -70,10 +70,9 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
             const vec4 y1 = vec4(data_b_v4[yb + estep]);
             const vec4 y2 = vec4(data_b_v4[yb + 2u * estep]);
             const vec4 y3 = vec4(data_b_v4[yb + 3u * estep]);
-            vec4 y4 = vec4(0.0);
-            if (has5) {
-                y4 = vec4(data_b_v4[yb + 4u * estep]);
-            }
+            // no branch: a qh word reads a valid vec4 (y0 again) and drops it, so all the loads issue together
+            const vec4 y4l = vec4(data_b_v4[yb + (has5 ? 4u * estep : 0u)]);
+            const vec4 y4 = has5 ? y4l : vec4(0.0);
             const float s0 = y0.x + y0.y + y0.z + y0.w;
             const float s1 = y1.x + y1.y + y1.z + y1.w;
             const float s2 = y2.x + y2.y + y2.z + y2.w;
