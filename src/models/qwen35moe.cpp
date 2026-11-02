@@ -1,6 +1,18 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+// residual planes of the routed experts of a layer (null pointers when the file has none)
+static llm_moe_exps2 layer_moe_exps2(const llama_layer & layer) {
+    llm_moe_exps2 exps2;
+    exps2.up       = layer.ffn_up_exps2;
+    exps2.gate     = layer.ffn_gate_exps2;
+    exps2.down     = layer.ffn_down_exps2;
+    exps2.up_map   = layer.ffn_up_exps2_map;
+    exps2.gate_map = layer.ffn_gate_exps2_map;
+    exps2.down_map = layer.ffn_down_exps2_map;
+    return exps2;
+}
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -123,6 +135,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, mtp_flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, mtp_flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, mtp_flags);
+        create_tensor_exps2(layer, il, n_embd, n_ff_exp, n_expert, mtp_flags);
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, mtp_flags);
@@ -490,14 +503,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    const auto & layer = model.layers[il];
-    llm_moe_exps2 exps2;
-    exps2.up       = layer.ffn_up_exps2;
-    exps2.gate     = layer.ffn_gate_exps2;
-    exps2.down     = layer.ffn_down_exps2;
-    exps2.up_map   = layer.ffn_up_exps2_map;
-    exps2.gate_map = layer.ffn_gate_exps2_map;
-    exps2.down_map = layer.ffn_down_exps2_map;
+    const llm_moe_exps2 exps2 = layer_moe_exps2(model.layers[il]);
     const bool has_exps2 = exps2.up || exps2.gate || exps2.down;
 
     ggml_tensor * moe_out =
@@ -588,6 +594,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * tok_embd;
     ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.token) {
+        // same tensor as the main graph: a packed multi-plane type (_X2/_X3/_X4) carries all planes
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
@@ -682,7 +689,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_post_norm", il);
 
-    // MoE FFN — routed experts plus gated shared expert (mirrors qwen35moe).
+    // MoE FFN — routed experts plus gated shared expert (mirrors qwen35moe), with the same residual
+    // expert planes as a trunk block when the file has them
+    const llm_moe_exps2 exps2 = layer_moe_exps2(layer);
+    const bool has_exps2 = exps2.up || exps2.gate || exps2.down;
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             layer.ffn_gate_inp,
@@ -697,7 +708,9 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
             nullptr, layer.ffn_gate_up_exps,
             layer.ffn_up_exps_s,
             layer.ffn_gate_exps_s,
-            layer.ffn_down_exps_s);
+            layer.ffn_down_exps_s,
+            nullptr, nullptr, 1e-5f,
+            has_exps2 ? &exps2 : nullptr);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
     if (layer.ffn_up_shexp != nullptr) {
@@ -738,6 +751,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     cb(cur, "mtp_shared_head_norm", -1);
 
+    // shared LM head = the main one, all planes included when it is a packed multi-plane type
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
