@@ -108,25 +108,44 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     const uint e  = e0 & 255u;
     const bool hq = e >= 240u;
     const uint t0 = e < 160u ? (e >> 5) : (hq ? ((e - 240u) >> 2) : ((e - 160u) >> 4));
-    const uint b0 = e < 160u ? (q * 48u + (e & 31u)) : (hq ? q * 4u : (q * 48u + 32u + ((e - 160u) & 15u)));
+    const uint b0 = e < 160u ? (e & 31u) : (32u + ((e - 160u) & 15u));   // byte in the quarter's qs
     const uint m0 = t0 == 0u ? 1u : (t0 == 1u ? 3u : (t0 == 2u ? 9u : (t0 == 3u ? 27u : 81u)));
     const uint m1 = hq ? m0 * 3u : m0;
 
+    // one 32-bit load per 4 weights and plane; the base-3 digits of the 4 bytes come from a SWAR
+    // multiply-shift (bytes 0,2 and 1,3 as two 16-bit fields), w = sum_p d_p * digit - sum_p d_p
     float v[8];
     [[unroll]] for (uint j = 0u; j < 8u; ++j) {
         v[j] = 0.0;
     }
+    float dsum = 0.0;
     [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
         const uint ib = blk * PACKED_K + pk;
-        const float d = float(data_a[ib].d[e0 >> 7]);
-        [[unroll]] for (uint j = 0u; j < 8u; ++j) {
-            const uint qb = hq ? uint(data_a[ib].qh[b0 + (j & 3u)]) : uint(data_a[ib].qs[b0 + j]);
-            const uint m  = (hq && j >= 4u) ? m1 : m0;
-            v[j] += d * (float((((qb * m) & 255u) * 3u) >> 8) - 1.0);
+        const float d = unpackHalf2x16(data_a_tq32[ib].d[e0 >> 8])[(e0 >> 7) & 1u];
+        dsum += d;
+        uint w[2];
+        if (hq) {
+            w[0] = data_a_tq32[ib].qh[q];
+            w[1] = w[0];
+        } else {
+            w[0] = data_a_tq32[ib].qs[q * 12u + (b0 >> 2)];
+            w[1] = data_a_tq32[ib].qs[q * 12u + (b0 >> 2) + 1u];
+        }
+        [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+            const uint m = h == 0u ? m0 : m1;
+            uint lo = ((w[h] & 0x00FF00FFu) * m) & 0x00FF00FFu;
+            uint hi = (((w[h] >> 8) & 0x00FF00FFu) * m) & 0x00FF00FFu;
+            lo = ((lo * 3u) >> 8) & 0x00030003u;
+            hi = ((hi * 3u) >> 8) & 0x00030003u;
+            const uint dg = lo | (hi << 8);
+            v[4u * h     ] = fma(d, float( dg        & 255u), v[4u * h     ]);
+            v[4u * h + 1u] = fma(d, float((dg >>  8) & 255u), v[4u * h + 1u]);
+            v[4u * h + 2u] = fma(d, float((dg >> 16) & 255u), v[4u * h + 2u]);
+            v[4u * h + 3u] = fma(d, float( dg >> 24        ), v[4u * h + 3u]);
         }
     }
     [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-        store_a(col, k_pair + j, FLOAT_TYPEV2(v[2u * j], v[2u * j + 1u]));
+        store_a(col, k_pair + j, FLOAT_TYPEV2(v[2u * j] - dsum, v[2u * j + 1u] - dsum));
     }
 #elif defined(DATA_A_IQ1_M)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;

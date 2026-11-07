@@ -12656,6 +12656,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // ternary MoE prompt processing (Qwen3.5-35B-A3B shapes, 512 tokens): experts, dense packed planes, Q4_K reference
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0R_1024, GGML_TYPE_TQ1_0R_1024_X3, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 512, 512, 2048));
+    }
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0_X3, GGML_TYPE_TQ1_0R_1024_X3, GGML_TYPE_TQ1_0R_1024_X4}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, 512, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 512, 2048, {1, 1}, {1, 1}));
+    }
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, 512, 512));
+    }
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0R_1024, GGML_TYPE_TQ1_0R_1024_X3, GGML_TYPE_TQ1_0R_1024_X4, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, 512, 2048, {1, 1}, {1, 1}));
+    }
+
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 

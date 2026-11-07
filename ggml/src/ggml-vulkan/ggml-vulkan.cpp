@@ -6548,12 +6548,29 @@ static bool ggml_vk_tq1r_mm_enabled() {
     return on;
 }
 
+// number of packed planes of the multi-plane ternary types, 1 otherwise
+static uint32_t ggml_vk_tq_planes(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TQ1_0R_1024_X2: case GGML_TYPE_TQ1_0_X2: return 2;
+        case GGML_TYPE_TQ1_0R_1024_X3: case GGML_TYPE_TQ1_0_X3: return 3;
+        case GGML_TYPE_TQ1_0R_1024_X4: case GGML_TYPE_TQ1_0_X4: return 4;
+        default: return 1;
+    }
+}
+
 static ggml_type ggml_vk_mul_mat_b_type(
         ggml_backend_vk_context * ctx, ggml_type src0_type, const ggml_tensor * src1,
         ggml_type f16_type, ggml_prec prec, bool mul_mat_id, bool can_quantize_y, bool prefer_f16_b) {
     auto available = [&](ggml_type b) {
         return ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0_type, b, prec, mul_mat_id) != nullptr;
     };
+    // Packed ternary planes: the int8 path does one MMA per plane, the float path decodes the sum of the planes
+    // once and does one f16 MMA, which is faster for dense matmuls (measured on gfx1151); the expert matmuls keep
+    // the int8 path. GGML_VK_TQ1_MMQ_PLANES=1 forces the int8 path for dense too.
+    static const bool int8_planes = []() { const char * e = getenv("GGML_VK_TQ1_MMQ_PLANES"); return e != nullptr && atoi(e) != 0; }();
+    if (!mul_mat_id && !int8_planes && ggml_vk_tq_planes(src0_type) > 1) {
+        can_quantize_y = false;
+    }
     if (ggml_vk_tq1r_rotates_y(src0_type) && ggml_vk_tq1r_mm_enabled()) {
         // B is rotated before the matmul: rotated and quantized to q8_1 for the int8 path, rotated in f32 otherwise
         if (can_quantize_y && src1->ne[0] % 1024 == 0 && ctx->device->pipeline_rot_q8_1_tq1r != nullptr && available(GGML_TYPE_Q8_1)) {
