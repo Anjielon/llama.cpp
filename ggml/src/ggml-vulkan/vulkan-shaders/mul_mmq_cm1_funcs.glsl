@@ -504,6 +504,98 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     }
 }
 
+#elif defined(DATA_A_TQ1_0) || defined(DATA_A_TQ1_0R_1024)
+
+// Ternary types: base-3 packed trits (5 per byte in qs, 4 per byte in qh), decoded to int8 {-1, 0, 1}.
+// TQ1_0: one fp16 scale per 256 weights. TQ1_0R_1024: four 256-weight quarters packed like TQ1_0, one fp16
+// scale per 128 weights, weights in the rotated domain (B is rotated and quantized by rot_q8_1_tq1_0r_1024.comp).
+// Packed planes (PACKED_K > 1): plane k of packed block b is base block b * PACKED_K + k, each plane has its own
+// scales, so each plane gets its own int8 tile and scale row in shared memory (a plane is one more K sub-block).
+
+// Four base-3 digits t (multiplier m = 3^t) of the four bytes of w, as packed int8 trits digit - 1.
+// Same integers as the reference ((b * 3^t) & 255) * 3 >> 8: bytes 0,2 and 1,3 are processed as two 16-bit
+// fields (255 * 81 < 65536 and 255 * 3 < 65536, so no carry crosses a field).
+uint32_t tq_trits4(const uint w, const uint m) {
+    uint lo = ((w & 0x00FF00FFu) * m) & 0x00FF00FFu;
+    uint hi = (((w >> 8) & 0x00FF00FFu) * m) & 0x00FF00FFu;
+    lo = ((lo * 3u) >> 8) & 0x00030003u;
+    hi = ((hi * 3u) >> 8) & 0x00030003u;
+    const uint dg = lo | (hi << 8);
+    return ((dg | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+}
+
+uint tq_pow3(const uint t) {
+    return t == 0u ? 1u : (t == 1u ? 3u : (t == 2u ? 9u : (t == 3u ? 27u : 81u)));
+}
+
+struct block_a_prefetch {
+    uint32_t qs[2 * PACKED_K];
+    float d[PACKED_K];
+};
+
+// 8 consecutive weights of a 256-weight group starting at e0 (multiple of 8): byte offset b0 (qs bytes 0..47,
+// or qh bytes 48..51) and the digit multipliers of the first and second four weights
+void tq_locate8(const uint e0, out uint b0, out uint m0, out uint m1) {
+    if (e0 < 160u) {
+        b0 = e0 & 31u;                 m0 = tq_pow3(e0 >> 5);          m1 = m0;
+    } else if (e0 < 240u) {
+        b0 = 32u + ((e0 - 160u) & 15u); m0 = tq_pow3((e0 - 160u) >> 4); m1 = m0;
+    } else {
+        b0 = 48u;                      m0 = tq_pow3((e0 - 240u) >> 2); m1 = m0 * 3u;
+    }
+}
+
+block_a_prefetch block_a_load(uint ib, uint loadr) {
+    block_a_prefetch blk;
+#if defined(DATA_A_TQ1_0)
+    const uint ib_k = ib / 8u;
+    const uint e0 = (ib % 8u) * 32u + loadr * 8u;
+#else
+    const uint ib_k = ib / 32u;
+    const uint sub32 = ib % 32u;
+    const uint q = sub32 >> 3;
+    const uint e0 = (sub32 & 7u) * 32u + loadr * 8u;
+#endif
+    uint b0, m0, m1;
+    tq_locate8(e0, b0, m0, m1);
+    [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+        const uint bi = ib_k * PACKED_K + pk;
+        uint w0, w1;
+#if defined(DATA_A_TQ1_0)
+        if (b0 < 48u) {
+            w0 = pack32(u16vec2(data_a_tq16[bi].qs[b0 / 2u     ], data_a_tq16[bi].qs[b0 / 2u + 1u]));
+            w1 = pack32(u16vec2(data_a_tq16[bi].qs[b0 / 2u + 2u], data_a_tq16[bi].qs[b0 / 2u + 3u]));
+        } else {
+            w0 = pack32(u16vec2(data_a_tq16[bi].qh[0], data_a_tq16[bi].qh[1]));
+            w1 = w0;
+        }
+        blk.d[pk] = (loadr == 0u) ? float(data_a_tq16[bi].d) : 0.0;
+#else
+        if (b0 < 48u) {
+            w0 = data_a_tq32[bi].qs[q * 12u + b0 / 4u];
+            w1 = data_a_tq32[bi].qs[q * 12u + b0 / 4u + 1u];
+        } else {
+            w0 = data_a_tq32[bi].qh[q];
+            w1 = w0;
+        }
+        blk.d[pk] = (loadr == 0u) ? unpackHalf2x16(data_a_tq32[bi].d[sub32 >> 3])[(sub32 >> 2) & 1u] : 0.0;
+#endif
+        blk.qs[2u * pk     ] = tq_trits4(w0, m0);
+        blk.qs[2u * pk + 1u] = tq_trits4(w1, m1);
+    }
+    return blk;
+}
+
+void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+    [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+        buf_a_qs[pk * BM * QPITCH + buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = blk.qs[2u * pk];
+        buf_a_qs[pk * BM * QPITCH + buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = blk.qs[2u * pk + 1u];
+        if (loadr == 0) {
+            buf_a_d[pk * BM * BK_STEP + ks * BM + buf_ib] = in_bounds ? blk.d[pk] : 0.0f;
+        }
+    }
+}
+
 #endif
 
 // ===== B-side: load and store =====

@@ -340,6 +340,14 @@ struct block_tq1_0
     float16_t d;
 };
 
+// 16-bit view of block_tq1_0 (54 bytes, 2-byte aligned) for the int8 matmul
+struct block_tq1_0_packed16
+{
+    uint16_t qs[24];
+    uint16_t qh[2];
+    float16_t d;
+};
+
 // Element e in [0,255] -> its packed byte (0..47 qs, 48..51 qh) and digit.
 uint tq1_0_byte_of(uint e) {
     return e < 160u ? (e % 32u)
@@ -374,6 +382,14 @@ struct block_tq1_0r_1024
     uint8_t qs[4 * 48];
     uint8_t qh[4 * 4];
     float16_t d[8];
+};
+
+// 32-bit view of block_tq1_0r_1024 (224 bytes) for the int8 matmul; d holds the 8 fp16 scales as 4 pairs
+struct block_tq1_0r_1024_packed32
+{
+    uint32_t qs[48];
+    uint32_t qh[4];
+    uint32_t d[4];
 };
 
 #if defined(DATA_A_TQ1_0R_1024)
