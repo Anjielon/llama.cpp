@@ -5868,6 +5868,74 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+// residual expert planes as built by llm_graph_context::build_moe_ffn: y = W[ids] x + W2[map[ids]] x, with map[e] = -1
+// for the experts without a plane (MUL_MAT_ID gives zero rows for negative ids). Backends may fuse the three nodes.
+struct test_mul_mat_id_res : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int n_planes;
+    const bool b; // broadcast b matrix
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, n_mats, n_used, n_planes, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_res(ggml_type type_a, int n_mats, int n_used, int n_planes, bool b, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_planes(n_planes), b(b), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as  = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * as2 = ggml_new_tensor_3d(ctx, type_a, k, m, n_planes);
+        ggml_tensor * map = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        ggml_set_name(map, "map");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+
+        ggml_tensor * map_t = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, map, 1, n_mats, 1), 1, n_mats, n, 1);
+        ggml_tensor * slot  = ggml_get_rows(ctx, map_t, ids);
+        ggml_tensor * ids2  = ggml_cast(ctx, ggml_reshape_2d(ctx, slot, n_used, n), GGML_TYPE_I32);
+
+        ggml_tensor * y  = ggml_mul_mat_id(ctx, as,  x, ids);
+        ggml_tensor * y2 = ggml_mul_mat_id(ctx, as2, x, ids2);
+        // y2 first: the graph then visits the slot ids before the two matmuls, which end up adjacent
+        ggml_tensor * out = ggml_add(ctx, y2, y);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "map") == 0) {
+                std::vector<float> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = (i % 3 == 1) ? -1.0f : (float) (i % n_planes);   // a third of the experts without a plane
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_RES";
+    }
+};
+
 struct test_mul_mat_id_shared : public test_case {
     const ggml_type type;
     const int64_t n;
@@ -11598,6 +11666,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 2048, 1, 512, 0, false, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 2048, 64, 512, 0, false, true));
+    // residual expert planes fused into the expert matmul (second K pass over W2[map[e]])
+    for (int n : {1, 9, 64}) {
+        test_cases.emplace_back(new test_mul_mat_id_res(GGML_TYPE_TQ1_0R_1024, 16, 4, 5, true,  256, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_res(GGML_TYPE_TQ1_0,       16, 4, 5, false, 512, n,  512));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_res(GGML_TYPE_TQ1_0R_1024, 16, 4, 5, false, 200, 67, 3072));
+    // model shapes: 256 experts, 8 used, 105 residual planes, 512 tokens
+    test_cases.emplace_back(new test_mul_mat_id_res(GGML_TYPE_TQ1_0R_1024, 256, 8, 105, true,  512, 512, 2048));
+    test_cases.emplace_back(new test_mul_mat_id_res(GGML_TYPE_TQ1_0,       256, 8, 105, false, 2048, 512, 512));
     // ADD(y, MUL_MAT_ID) of the residual expert planes, fused into the batched int8 matmul (accumulate)
     for (bool skip : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_TQ1_0R_1024, GGML_TYPE_F32, 16, 4, false, 256, 64, 2048, 2, false, skip));

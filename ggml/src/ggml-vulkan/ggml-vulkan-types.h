@@ -259,10 +259,11 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    bool res = false;   // MUL_MAT_ID with the residual expert plane fused in (mul_mmq_cm1.comp, MUL_MAT_ID_RES)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, res)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.res);
     }
 };
 
@@ -1293,6 +1294,10 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     // MUL_MAT_ID followed by ADD(y, MUL_MAT_ID): the batched int8 matmul accumulates into the ADD output
     bool fused_mmid_add_acc {};
+    // MUL_MAT_ID, MUL_MAT_ID(residual plane, ids = map[ids]), ADD: one matmul with a second K pass over the plane
+    bool fused_mmid_res {};
+    const ggml_tensor * fused_mmid_res_map {};
+    bool fused_mmid_res_swapped {};   // the residual matmul comes first
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 

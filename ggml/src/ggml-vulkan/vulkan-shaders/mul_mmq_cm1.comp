@@ -40,6 +40,17 @@ layout (binding = 0) readonly buffer A_TQ16 {block_tq1_0_packed16 data_a_tq16[];
 layout (binding = 0) readonly buffer A_TQ32 {block_tq1_0r_1024_packed32 data_a_tq32[];};
 #endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
+#ifdef MUL_MAT_ID_RES
+// residual expert planes fused into the expert matmul: W2 (same type and shape per expert as A) and the map
+// expert -> W2 slot (-1 = no residual plane). The tile of expert e runs a second K pass over W2[map[e]].
+#if defined(DATA_A_TQ1_0)
+layout (binding = 5) readonly buffer A2_TQ16 {block_tq1_0_packed16 data_a2_tq16[];};
+#else
+layout (binding = 5) readonly buffer A2_TQ32 {block_tq1_0r_1024_packed32 data_a2_tq32[];};
+#endif
+layout (binding = 6) readonly buffer RES_MAP {float data_res_map[];};
+uint g_pass = 0u;   // 0: A, 1: W2
+#endif
 #ifdef MUL_MAT_ID
 layout (binding = 2) buffer D {D_TYPE data_d[];};   // read back when p.accumulate != 0
 #else
@@ -303,7 +314,15 @@ void main() {
 
     barrier();
 
-    for (uint block = start_k; block < end_k; block += BK * BK_STEP) {
+#ifdef MUL_MAT_ID_RES
+    // virtual K range [0, 2 K): the second half runs over the residual plane W2[map[expert]] with the same B
+    const int res_slot = int(data_res_map[expert_idx]);
+    const uint total_k = res_slot >= 0 ? 2u * end_k : end_k;
+#else
+    const uint total_k = end_k;
+#endif
+    for (uint vblock = start_k; vblock < total_k; vblock += BK * BK_STEP) {
+        const uint block = vblock < end_k ? vblock : vblock - end_k;
         STORE_BLOCK_TO_LDS(block)
 
         barrier();
@@ -311,8 +330,16 @@ void main() {
         pos_a_ib += BK_STEP;
         pos_b_ib += BK_STEP;
 
-        const uint next_block = block + BK * BK_STEP;
-        if (next_block < end_k) {
+        const uint next_vblock = vblock + BK * BK_STEP;
+        if (next_vblock < total_k) {
+#ifdef MUL_MAT_ID_RES
+            if (next_vblock == end_k) {
+                g_pass = 1u;
+                pos_a_ib = uint(res_slot) * (p.batch_stride_a / BK) + (ir * BM * p.stride_a) / BK;
+                pos_b_ib = 0;
+            }
+#endif
+            const uint next_block = next_vblock < end_k ? next_vblock : next_vblock - end_k;
             PREFETCH_BLOCK(next_block)
         }
 
