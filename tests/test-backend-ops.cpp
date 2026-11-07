@@ -11250,8 +11250,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // int8 matmul: partial tiles in m and n, odd k block count, batch broadcast
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, 67, 3072, {2, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 200, 67, 3072));
-        // ids set to -1 (skipped slots, zeroed rows)
-        for (int n : {1, 3}) {
+        // ids set to -1 (skipped slots, zeroed rows); n >= 9 goes through the batched matmul
+        for (int n : {1, 3, 9, 64}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 512, n, 2048, 0, false, true));
         }
     }
@@ -11267,7 +11267,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int n : {1, 9}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 2048, n, 512));
         }
-        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 2048, 1, 512, 0, false, true));
+        for (int n : {1, 64}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 2048, n, 512, 0, false, true));
+        }
     }
     // int8 matmul of the ternary types: partial tiles in m and n, odd block count in k
     for (ggml_type type_a : {GGML_TYPE_TQ1_0, GGML_TYPE_TQ1_0_X2, GGML_TYPE_TQ1_0_X3, GGML_TYPE_TQ1_0_X4}) {
@@ -11595,6 +11597,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 2048, 1, 512, 0, false, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 2048, 64, 512, 0, false, true));
+    // ADD(y, MUL_MAT_ID) of the residual expert planes, fused into the batched int8 matmul (accumulate)
+    for (bool skip : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_TQ1_0R_1024, GGML_TYPE_F32, 16, 4, false, 256, 64, 2048, 2, false, skip));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_TQ1_0,       GGML_TYPE_F32, 16, 4, false, 256, 64,  512, 2, false, skip));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_TQ1_0R_1024, GGML_TYPE_F32, 16, 4, true,  256, 64, 2048, 2, false, skip));
+    }
 
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
 #if 0

@@ -6311,13 +6311,13 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        uint32_t row_ids_offset, uint32_t max_tiles) {
+        uint32_t row_ids_offset, uint32_t max_tiles, bool accumulate = false) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, n_as, row_ids_offset };
+                                              nei0, nei1, nbi1, ne11, n_as, row_ids_offset, accumulate ? 1u : 0u };
     const uint32_t tiles_y = std::min(max_tiles, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
     const std::array<uint32_t, 3> elements = { m, tiles_y * pipeline->wg_denoms[1], uint32_t(CEIL_DIV(max_tiles, tiles_y)) };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, elements);
@@ -6575,6 +6575,16 @@ static void ggml_vk_tq1r_quantize_y(ggml_backend_vk_context * ctx, vk_context& s
 static bool ggml_vk_tq1r_mm_enabled() {
     static const bool on = []() { const char * e = getenv("GGML_VK_TQ1R_MM"); return e == nullptr || atoi(e) != 0; }();
     return on;
+}
+
+static bool ggml_vk_is_tq_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TQ1_0: case GGML_TYPE_TQ1_0_X2: case GGML_TYPE_TQ1_0_X3: case GGML_TYPE_TQ1_0_X4:
+        case GGML_TYPE_TQ1_0R_1024: case GGML_TYPE_TQ1_0R_1024_X2: case GGML_TYPE_TQ1_0R_1024_X3: case GGML_TYPE_TQ1_0R_1024_X4:
+            return true;
+        default:
+            return false;
+    }
 }
 
 // number of packed planes of the multi-plane ternary types, 1 otherwise
@@ -7815,7 +7825,9 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     }
 }
 
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+// accumulate: dst already holds y (ADD(y, MUL_MAT_ID) fused, see ggml_vk_mmid_add_acc_ok); the matmul adds its rows
+// to it and the skipped slots (negative ids) keep y
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, bool accumulate = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -7897,6 +7909,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                         ggml_prec_get_acc(dst), true, can_quantize_y, prefer_f16_b);
 
     const bool quantize_y   = y_kernel_type == GGML_TYPE_Q8_1;
+    GGML_ASSERT(!accumulate || quantize_y);
     const bool y_f32_kernel = y_kernel_type == GGML_TYPE_F32;
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
@@ -8091,7 +8104,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
                                            (uint32_t)n_as,
                                            0, 0, bn, (uint32_t)row_ids_offset,
-                                           (uint32_t)ne01,
+                                           accumulate ? 0u : (uint32_t)ne01,  // accumulate: the skipped rows keep y
                                            (uint32_t)(dst->nb[1] / sizeof(float)),
                                            (uint32_t)(dst->nb[2] / sizeof(float)) };
         init_pushconst_fastdiv(pc);
@@ -8184,7 +8197,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         { d_D, d_buf_offset, d_sz }, std::move(d_ids), expert_count_buf,
         ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
-        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, row_ids_offset, max_tiles
+        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, row_ids_offset, max_tiles, accumulate
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -8459,12 +8472,66 @@ bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx)
     return ggml_vk_use_mul_mat_vec_id(cgraph->nodes[node_idx]);
 }
 
+// ADD(y, MUL_MAT_ID(w, x, ids)) with a ternary w on the batched int8 path (the residual expert planes): the matmul
+// accumulates into the ADD output (copied from y unless the allocator already put it in place), which also removes
+// the zeroing of the skipped slots. Mirrors the B type choice of ggml_vk_mul_mat_id_q_f16.
+static bool ggml_vk_mmid_add_acc_ok(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool off = []() { const char * e = getenv("GGML_VK_TQ1_MMID_ADD"); return e != nullptr && atoi(e) == 0; }();
+    if (off || !ggml_vk_tq1_mmq_enabled()) {
+        return false;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[node_idx];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (!ggml_vk_is_tq_type(src0->type)) {
+        return false;
+    }
+    if (ggml_vk_use_mul_mat_vec_id(mm) || !ggml_vk_dim01_contiguous(src0) || ctx->device->coopmat2) {
+        return false;
+    }
+    const ggml_tensor * y = add->src[0] == mm ? add->src[1] : add->src[0];
+    if (add->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(add, mm) || !ggml_are_same_shape(y, mm) ||
+        !ggml_is_contiguous(add) || !ggml_is_contiguous(y) || !ggml_is_contiguous(mm) ||
+        get_misalign_bytes(ctx, add) != 0 || get_misalign_bytes(ctx, y) != 0) {
+        return false;
+    }
+    const uint64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
+    const bool can_quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
+                                ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(mm);
+    const bool prefer_f16_b = ctx->device->coopmat_support && !ctx->device->coopmat2 &&
+                              ctx->device->vendor_id == VK_VENDOR_ID_INTEL;
+    return ggml_vk_mul_mat_b_type(ctx, src0->type, src1, GGML_TYPE_F16, ggml_prec_get_acc(mm), true,
+                                  can_quantize_y, prefer_f16_b) == GGML_TYPE_Q8_1;
+}
+
 void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * src2 = dst->src[2];
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
+    if (ctx->fused_mmid_add_acc) {
+        // ADD(y, MUL_MAT_ID): the matmul accumulates into the ADD output, which must hold y first
+        ggml_tensor * add = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * y = add->src[0] == dst ? add->src[1] : add->src[0];
+        if (getenv("GGML_VK_TQ1R_DEBUG")) {
+            static int n_dbg = 0;
+            if (n_dbg++ < 4) {
+                fprintf(stderr, "mmid+add fused: %s in place=%d\n", ggml_type_name(src0->type), (int)(y->data == add->data));
+            }
+        }
+        if (y->data != add->data) {
+            vk_subbuffer s = ggml_vk_tensor_subbuffer(ctx, y);
+            vk_subbuffer d = ggml_vk_tensor_subbuffer(ctx, add);
+            vk::BufferCopy bc{ s.offset, d.offset, ggml_nbytes(add) };
+            subctx->s->buffer->buf.copyBuffer(s.buffer->buffer, d.buffer->buffer, { bc });
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, add, true);
+        return;
+    }
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
@@ -14971,6 +15038,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
+        ctx->fused_mmid_add_acc = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -14999,6 +15067,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ID_ADD_ID";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD }) &&
+                       ggml_vk_mmid_add_acc_ok(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_mmid_add_acc = true;
+                fusion_string = "MUL_MAT_ID_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL })) {
@@ -15213,6 +15288,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
+                ctx->fused_mmid_add_acc = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -15469,6 +15545,18 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(rope_view_set_rows_pattern)) {
             continue;
         }
+        // ADD(y, MUL_MAT_ID) of the ternary residual expert planes: keep the pair adjacent so that the matmul can
+        // accumulate into the ADD output (ggml_vk_mmid_add_acc_ok)
+        auto const &is_tq_mmid_add = [&](int n) -> bool {
+            return match_pattern({ GGML_OP_MUL_MAT_ID, GGML_OP_ADD }, n) &&
+                   ggml_vk_is_tq_type(graph->nodes[n]->src[0]->type) &&
+                   !ggml_vk_use_mul_mat_vec_id(graph->nodes[n]) &&
+                   (graph->nodes[n + 1]->src[0] == graph->nodes[n] || graph->nodes[n + 1]->src[1] == graph->nodes[n]);
+        };
+        if (is_tq_mmid_add(first_unused)) {
+            keep_pattern({ GGML_OP_MUL_MAT_ID, GGML_OP_ADD });
+            continue;
+        }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
@@ -15514,7 +15602,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
-                match_pattern(hc_post_gate_pattern, j)) {
+                match_pattern(hc_post_gate_pattern, j) ||
+                is_tq_mmid_add(j)) {
                 continue;
             }
             bool ok = true;
