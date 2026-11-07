@@ -2,19 +2,36 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 
 #include "mul_mat_vec_base.glsl"
+#include "tq1_0r_1024_common.glsl"
+
+// Mat-vec of TQ1_0 (and its packed planes TQ1_0_X2..X4).
+//
+// The unit of work is one 32-bit word of a block: the 52 bytes of qs and qh are 13 words (8 of the first qs
+// chunk, 4 of the second, 1 of qh), the same geometry as one quarter of TQ1_0R_1024. For digit t the 4 bytes of a
+// word cover 4 consecutive elements, so the activation is read as vec4 and the 5 digits of the 4 bytes are decoded
+// at once with the SWAR helper of tq1_0r_1024_common.glsl.
+// trit = x - 1 with x in {0, 1, 2}: dot(x - 1, y) = dot(x, y) - sum(y), the sum is computed once per word and
+// shared by all the planes and rows.
+//
+// Blocks are 54 bytes, so the weights are read as 16-bit halves (27 per block). The work items of all the rows
+// of a workgroup are spread over the lanes together (row-major), so that a short row (k = 512: 26 words) still
+// keeps the whole subgroup busy.
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+layout (binding = 0) readonly buffer A16 {uint16_t data_a16[];};
+
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
-// Walks the packed bytes directly (byte m, digit t) rather than via
-// tq1_0_byte_of()/tq1_0_digit_of(): one byte per thread, expanded in place.
+const uint TQ1_HALVES = 27u; // 54 bytes per block
+
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     uint a_offset, b_offset, d_offset;
     get_offsets(a_offset, b_offset, d_offset);
 
-    const uint num_blocks_per_row = p.ncols / QUANT_K;
+    const uint nb = p.ncols / QUANT_K;
     const uint tid = gl_LocalInvocationID.x;
+    const uint nwr = nb * 13u;          // words per row (per plane)
 
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
@@ -22,52 +39,52 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
-    for (uint nrow = 0; nrow < num_rows; ++nrow) {
-        const uint ib0 = a_offset + (first_row + nrow) * num_blocks_per_row;
-        for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
-            const uint b_base = (jcol * p.batch_stride_b);
-            for (uint i = tid/8; i < num_blocks_per_row; i += gl_WorkGroupSize.x/8) {
-                // packed planes (PACKED_K > 1): plane pk of block i is base block (ib0 + i)*PACKED_K + pk
-                [[unroll]] for (uint pk = 0; pk < PACKED_K; ++pk) {
-                    const uint ib = (ib0 + i) * PACKED_K + pk;
-                    const FLOAT_TYPE d = float(data_a[ib].d);
+#ifdef MUL_MAT_ID
+    // a skipped slot (id -1) reads nothing: the row is zeroed by reduce_result
+    const uint nitems = expert_skip ? 0u : num_rows * nwr;
+#else
+    const uint nitems = num_rows * nwr;
+#endif
+    for (uint g = tid; g < nitems; g += BLOCK_SIZE) {
+        const uint n   = g / nwr;
+        const uint f   = g - n * nwr;
+        const uint blk = f / 13u;
+        const uint r   = f - blk * 13u;
+        const bool c1   = r < 8u;
+        const bool has5 = r < 12u;
+        const uint e0    = c1 ? (4u * r) : (has5 ? (160u + 4u * (r - 8u)) : 240u);
+        const uint estep = c1 ? 8u : (has5 ? 4u : 1u); // vec4 units
 
-                    // First qs chunk: 32 bytes (5*32 elements)
-                    [[unroll]] for (uint m = tid%8; m < 32; m += 8) {
-                        const uint q_byte = uint(data_a[ib].qs[m]);
-                        [[unroll]] for (uint t = 0; t < 5; ++t) {
-                            const uint xi = tq1_0_trit(q_byte, t);
-                            const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(xi) - 1.0f));
-                            const uint elem = t * 32u + m;
-                            const uint b_idx = i * QUANT_K + elem;
-                            temp[jcol][nrow] += dequant_val * FLOAT_TYPE(data_b[b_base + b_offset + b_idx]);
-                        }
-                    }
+        // decode every plane once, keep the digits for all the columns
+        vec4 x0[PACKED_K], x1[PACKED_K], x2[PACKED_K], x3[PACKED_K], x4[PACKED_K];
+        float dp[PACKED_K];
+        const uint ib0 = (a_offset + (first_row + n) * nb + blk) * PACKED_K;
+        [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+            const uint h = (ib0 + pk) * TQ1_HALVES;
+            const uint w = uint(data_a16[h + 2u * r]) | (uint(data_a16[h + 2u * r + 1u]) << 16);
+            dp[pk] = float(uint16BitsToHalf(data_a16[h + 26u]));
+            tq1_swar_digits(w, x0[pk], x1[pk], x2[pk], x3[pk], x4[pk]);
+        }
 
-                    // Second qs chunk: 16 bytes (5*16 elements)
-                    [[unroll]] for (uint m = tid%8; m < 16; m += 8) {
-                        const uint q_byte = uint(data_a[ib].qs[32u + m]);
-                        [[unroll]] for (uint t = 0; t < 5; ++t) {
-                            const uint xi = tq1_0_trit(q_byte, t);
-                            const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(xi) - 1.0f));
-                            const uint elem = 160u + t * 16u + m;
-                            const uint b_idx = i * QUANT_K + elem;
-                            temp[jcol][nrow] += dequant_val * FLOAT_TYPE(data_b[b_base + b_offset + b_idx]);
-                        }
-                    }
+        [[unroll]] for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
+            const uint yb = (jcol * p.batch_stride_b + b_offset + blk * QUANT_K + e0) >> 2;
+            const vec4 y0 = vec4(data_b_v4[yb]);
+            const vec4 y1 = vec4(data_b_v4[yb + estep]);
+            const vec4 y2 = vec4(data_b_v4[yb + 2u * estep]);
+            const vec4 y3 = vec4(data_b_v4[yb + 3u * estep]);
+            // no branch: a qh word reads a valid vec4 (y0 again) and drops it
+            const vec4 y4l = vec4(data_b_v4[yb + (has5 ? 4u * estep : 0u)]);
+            const vec4 y4 = has5 ? y4l : vec4(0.0);
+            const vec4 ys = (y0 + y1) + (y2 + y3) + y4;
+            const float s = (ys.x + ys.y) + (ys.z + ys.w);
 
-                    // qh bytes: 4 bytes (4*4 elements)
-                    [[unroll]] for (uint j = tid%8; j < 4; j += 8) {
-                        const uint qh_byte = uint(data_a[ib].qh[j]);
-                        [[unroll]] for (uint t = 0; t < 4; ++t) {
-                            const uint xi = tq1_0_trit(qh_byte, t);
-                            const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(xi) - 1.0f));
-                            const uint elem = 240u + t * 4u + j;
-                            const uint b_idx = i * QUANT_K + elem;
-                            temp[jcol][nrow] += dequant_val * FLOAT_TYPE(data_b[b_base + b_offset + b_idx]);
-                        }
-                    }
-                }
+            float acc = 0.0;
+            [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+                const float dt = (dot(x0[pk], y0) + dot(x1[pk], y1)) + (dot(x2[pk], y2) + dot(x3[pk], y3)) + dot(x4[pk], y4);
+                acc += dp[pk] * (dt - s);
+            }
+            [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+                temp[jcol][i] += (i == n) ? FLOAT_TYPE(acc) : FLOAT_TYPE(0);
             }
         }
     }

@@ -2307,8 +2307,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // residual plane of the experts: y += mask * W2[ids2] x, with s = map[id] (-1 = no plane for that expert),
     // mask = step(s + 0.5) and ids2 = s * mask, so that experts without a plane read slot 0 and are zeroed
-    // the mask and the slot ids depend only on the map: tensors that share a map share them too
-    ggml_tensor * exps2_map_done = nullptr, * exps2_mask = nullptr, * exps2_ids = nullptr;
+    // slot ids of the residual planes: the map holds -1 for the experts without one, and MUL_MAT_ID gives
+    // zero rows for negative ids, so no mask is needed; tensors that share a map share the ids too
+    ggml_tensor * exps2_map_done = nullptr, * exps2_ids = nullptr;
     auto build_exps2 = [&](ggml_tensor * y, ggml_tensor * w2, ggml_tensor * map, ggml_tensor * x) -> ggml_tensor * {
         if (map == nullptr) {
             GGML_ASSERT(w2->ne[2] == n_expert);
@@ -2319,11 +2320,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const int64_t n_tok  = selected_experts->ne[1];
             ggml_tensor * map_t = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, map, 1, n_expert, 1), 1, n_expert, n_tok, 1);
             ggml_tensor * s     = ggml_get_rows(ctx0, map_t, selected_experts);                  // [1, n_used, n_tok]
-            exps2_mask = ggml_step(ctx0, ggml_scale_bias(ctx0, s, 1.0f, 0.5f));                  // [1, n_used, n_tok]
-            exps2_ids  = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_mul(ctx0, s, exps2_mask), n_used, n_tok), GGML_TYPE_I32);
+            exps2_ids      = ggml_cast(ctx0, ggml_reshape_2d(ctx0, s, n_used, n_tok), GGML_TYPE_I32);
             exps2_map_done = map;
         }
-        return ggml_add(ctx0, y, ggml_mul(ctx0, build_lora_mm_id(w2, x, exps2_ids, nullptr), exps2_mask));
+        return ggml_add(ctx0, y, build_lora_mm_id(w2, x, exps2_ids, nullptr));
     };
     GGML_ASSERT(!(gate_up_exps && exps2 && (exps2->up || exps2->gate)) && "residual expert planes need separate gate and up experts");
 

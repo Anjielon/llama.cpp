@@ -6,9 +6,14 @@
 #include "mul_mat_vec_base.glsl"
 
 // Mat-vec of TQ1_0R_1024 and its packed planes with int8 dot products. The activation arrives rotated and quantized
-// by rot_q8_tq1_0r_1024.comp, in the byte order of the weights (264 uints per block). A shared table gives the digits
-// t = 0..3 of each weight byte as 4 int8 {0,1,2}, then one dotPacked4x8 per byte; digit t = 4 of the 4 bytes of a word
-// is assembled from 4 shifted tables for a fifth product. trit = x - 1: the sum of the int8 is subtracted per word.
+// by rot_q8_tq1_0r_1024.comp: int8 in natural element order (264 uints per block, scale of quarter q at 260 + q).
+//
+// Unit of work: one 32-bit word of a block (52 per block: 48 of qs, 4 of qh). For digit t the 4 bytes of a word
+// cover 4 consecutive elements, i.e. one uint of the int8 activation. The digits of the 4 bytes are decoded in
+// registers (no table, no shared memory): with bytes 0,2 and 1,3 in two words of 16-bit fields, c_(t+1) = 3 c_t mod
+// 256 and digit_t = (3 c_t) >> 8 is bits 8..9 of the field (3 * 255 < 1024, bits 10..15 stay zero), so the 4
+// digits of step t are already in the 4 bytes of ((m02 >> 8) & 0x00FF00FF) | (m13 & 0xFF00FF00): one int8x4 for
+// dotPacked4x8EXT. trit = x - 1: the sum of the activation int8 of the word is subtracted once per plane.
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -19,20 +24,27 @@ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 const uint TQ1R_WORDS = 56u;
 const uint YQ_WORDS = 264u;
 
-shared uint lut_a[256];      // cifre 0..3 del byte b come 4 int8
-shared uint lut_b[4][256];   // cifra 4 del byte b spostata nel byte k
-
-uint xi_digit(const uint b, const uint t) {
-    const uint pow3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
-    return (((b * pow3[t]) & 255u) * 3u) >> 8;
+// one Horner step of the SWAR decode: returns the 4 digits (int8x4) of step t and advances the state
+int tq1_digits_step(inout uint w02, inout uint w13) {
+    const uint m02 = (w02 << 1) + w02;
+    const uint m13 = (w13 << 1) + w13;
+    w02 = m02 & 0x00FF00FFu;
+    w13 = m13 & 0x00FF00FFu;
+    return int(((m02 >> 8) & 0x00FF00FFu) | (m13 & 0xFF00FF00u));
 }
 
+// contribution of one word of one plane, before the activation scale
 float plane_q8(const uint w, const uint dw, const bool c1,
-               const int Y0, const int Y1, const int Y2, const int Y3, const int Yb, const int sY, const int sYb) {
-    const uint b0 = w & 255u, b1 = (w >> 8) & 255u, b2 = (w >> 16) & 255u, b3 = w >> 24;
-    const int ilo = dotPacked4x8EXT(int(lut_a[b0]), Y0) + dotPacked4x8EXT(int(lut_a[b1]), Y1) +
-                    dotPacked4x8EXT(int(lut_a[b2]), Y2) + dotPacked4x8EXT(int(lut_a[b3]), Y3) - sY;
-    const int ihi = dotPacked4x8EXT(int(lut_b[0][b0] | lut_b[1][b1] | lut_b[2][b2] | lut_b[3][b3]), Yb) - sYb;
+               const int Y0, const int Y1, const int Y2, const int Y3, const int Y4, const int sY, const int sY4) {
+    uint w02 = w & 0x00FF00FFu;
+    uint w13 = (w >> 8) & 0x00FF00FFu;
+    const int D0 = tq1_digits_step(w02, w13);
+    const int D1 = tq1_digits_step(w02, w13);
+    const int D2 = tq1_digits_step(w02, w13);
+    const int D3 = tq1_digits_step(w02, w13);
+    const int D4 = tq1_digits_step(w02, w13);
+    const int ilo = dotPacked4x8EXT(D0, Y0) + dotPacked4x8EXT(D1, Y1) + dotPacked4x8EXT(D2, Y2) + dotPacked4x8EXT(D3, Y3) - sY;
+    const int ihi = dotPacked4x8EXT(D4, Y4) - sY4;
     const vec2 dd = unpackHalf2x16(dw);
     return c1 ? (dd.x * float(ilo) + dd.y * float(ihi)) : (dd.y * float(ilo + ihi));
 }
@@ -43,8 +55,8 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     const uint nb = p.ncols / 1024u;
     const uint tid = gl_LocalInvocationID.x;
-    // b_offset e i passi di colonna sono in elementi dell'attivazione originale (K per colonna):
-    // qui la colonna occupa nb * 264 uint.
+    // b_offset and the column strides count elements of the original activation (K per column):
+    // here a column takes nb * 264 uints.
     const uint ycol0 = (b_offset / p.ncols) * nb * YQ_WORDS;
     const uint ycols = (p.batch_stride_b / p.ncols) * nb * YQ_WORDS;
 
@@ -54,26 +66,37 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
+#ifdef MUL_MAT_ID
+    // a skipped slot (id -1) reads nothing: the row is zeroed by reduce_result
+    const uint nws = expert_skip ? 0u : nb * 52u;
+#else
     const uint nws = nb * 52u;
+#endif
     for (uint f = tid; f < nws; f += BLOCK_SIZE) {
         const uint blk = f / 52u;
         const uint ws  = f - blk * 52u;
         const uint q   = ws / 13u;
         const uint r   = ws - q * 13u;
-        const bool c1  = r < 8u;
-        const uint wword = r < 12u ? (q * 12u + r) : (48u + q);
+        const bool c1   = r < 8u;
+        const bool has5 = r < 12u;
+        const uint wword = has5 ? (q * 12u + r) : (48u + q);
+        // first activation uint of the word and the step between digits (uints): 32, 16 or 4 elements
+        const uint y0 = q * 64u + (c1 ? r : (has5 ? 40u + (r - 8u) : 60u));
+        const uint ys = c1 ? 8u : (has5 ? 4u : 1u);
 
         [[unroll]] for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
             const uint yb = ycol0 + jcol * ycols + blk * YQ_WORDS;
-            const int Y0 = int(data_b[yb + 4u * ws]);
-            const int Y1 = int(data_b[yb + 4u * ws + 1u]);
-            const int Y2 = int(data_b[yb + 4u * ws + 2u]);
-            const int Y3 = int(data_b[yb + 4u * ws + 3u]);
-            const int Yb = int(data_b[yb + 208u + ws]);
-            const float ys = uintBitsToFloat(data_b[yb + 260u + q]);
+            const int Y0 = int(data_b[yb + y0]);
+            const int Y1 = int(data_b[yb + y0 + ys]);
+            const int Y2 = int(data_b[yb + y0 + 2u * ys]);
+            const int Y3 = int(data_b[yb + y0 + 3u * ys]);
+            // no branch: a qh word (4 digits) reads a valid uint and drops it
+            const int Y4l = int(data_b[yb + y0 + (has5 ? 4u * ys : 0u)]);
+            const int Y4 = has5 ? Y4l : 0;
+            const float yscale = uintBitsToFloat(data_b[yb + 260u + q]);
             const int ones = 0x01010101;
             const int sY  = dotPacked4x8EXT(Y0, ones) + dotPacked4x8EXT(Y1, ones) + dotPacked4x8EXT(Y2, ones) + dotPacked4x8EXT(Y3, ones);
-            const int sYb = dotPacked4x8EXT(Yb, ones);
+            const int sY4 = dotPacked4x8EXT(Y4, ones);
 
             [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                 if (n >= num_rows) {
@@ -83,9 +106,10 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
                 const uint wb = ((a_offset + (first_row + n) * nb + blk) * PACKED_K) * TQ1R_WORDS;
                 float acc = 0.0;
                 [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
-                    acc += plane_q8(data_aw[wb + pk * TQ1R_WORDS + wword], data_aw[wb + pk * TQ1R_WORDS + 52u + q], c1, Y0, Y1, Y2, Y3, Yb, sY, sYb);
+                    acc += plane_q8(data_aw[wb + pk * TQ1R_WORDS + wword], data_aw[wb + pk * TQ1R_WORDS + 52u + q], c1,
+                                    Y0, Y1, Y2, Y3, Y4, sY, sY4);
                 }
-                temp[jcol][n] += FLOAT_TYPE(ys * acc);
+                temp[jcol][n] += FLOAT_TYPE(yscale * acc);
             }
         }
     }
@@ -94,14 +118,6 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 }
 
 void main() {
-    // tabelle delle cifre (una volta per workgroup)
-    for (uint i = gl_LocalInvocationID.x; i < 256u; i += BLOCK_SIZE) {
-        lut_a[i] = xi_digit(i, 0u) | (xi_digit(i, 1u) << 8) | (xi_digit(i, 2u) << 16) | (xi_digit(i, 3u) << 24);
-        const uint d4 = xi_digit(i, 4u);
-        lut_b[0][i] = d4; lut_b[1][i] = d4 << 8; lut_b[2][i] = d4 << 16; lut_b[3][i] = d4 << 24;
-    }
-    barrier();
-
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
     if (first_row + NUM_ROWS <= p.stride_d) {
