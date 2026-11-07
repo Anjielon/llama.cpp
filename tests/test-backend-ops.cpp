@@ -11598,6 +11598,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 2048, 1, 512, 0, false, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 2048, 64, 512, 0, false, true));
+    // ADD(y, MUL_MAT_ID) of the residual expert planes, fused into the batched int8 matmul (accumulate)
+    for (bool skip : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_TQ1_0R_1024, GGML_TYPE_F32, 16, 4, false, 256, 64, 2048, 2, false, skip));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_TQ1_0,       GGML_TYPE_F32, 16, 4, false, 256, 64,  512, 2, false, skip));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_TQ1_0R_1024, GGML_TYPE_F32, 16, 4, true,  256, 64, 2048, 2, false, skip));
+    }
 
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
 #if 0

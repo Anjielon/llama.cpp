@@ -1291,6 +1291,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    // MUL_MAT_ID followed by ADD(y, MUL_MAT_ID): the batched int8 matmul accumulates into the ADD output
+    bool fused_mmid_add_acc {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 

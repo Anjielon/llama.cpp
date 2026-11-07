@@ -40,7 +40,11 @@ layout (binding = 0) readonly buffer A_TQ16 {block_tq1_0_packed16 data_a_tq16[];
 layout (binding = 0) readonly buffer A_TQ32 {block_tq1_0r_1024_packed32 data_a_tq32[];};
 #endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
+#ifdef MUL_MAT_ID
+layout (binding = 2) buffer D {D_TYPE data_d[];};   // read back when p.accumulate != 0
+#else
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+#endif
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
@@ -67,6 +71,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint row_ids_offset;
+    uint accumulate;    // add to dst instead of overwriting it (fused ADD of the residual expert planes)
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -527,7 +532,8 @@ void main() {
 
                 const u16vec2 row_idx = row_ids[col_i - ic * BN];
                 const uint store_offset = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
-                data_d[store_offset] = D_TYPE(sums[tile_idx * CM_ELEMS + e]);
+                const D_TYPE prev = p.accumulate != 0 ? data_d[store_offset] : D_TYPE(0);
+                data_d[store_offset] = prev + D_TYPE(sums[tile_idx * CM_ELEMS + e]);
             }
         }
     }
