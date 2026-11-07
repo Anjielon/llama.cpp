@@ -689,6 +689,23 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             string_to_spv(shader_name + "_quant_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), {{"MULMAT_QUANT", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
         }
     }
+
+    // TQ1_0R_1024 and its packed planes: weights decoded in the rotated domain (load_a_to_shmem in mul_mm_funcs.glsl),
+    // the caller rotates B with rot_y_tq1_0r_1024.comp first
+    for (const auto& tname : tq_plane_type_names) {
+        if (!string_starts_with(tname, "tq1_0r_1024") || coopmat2) {
+            continue;
+        }
+        const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+        const std::map<std::string, std::string> float_type_dict = {
+            {"FLOAT_TYPE",   FLOAT_TYPE(1, tname)},
+            {"FLOAT_TYPEV2", FLOAT_TYPE(2, tname)},
+            {"FLOAT_TYPEV4", FLOAT_TYPE(4, tname)},
+            {"FLOAT_TYPEV8", FLOAT_TYPE(8, tname)},
+        };
+        string_to_spv(shader_name + "_" + tname + "_f16" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "8"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+        string_to_spv(shader_name + "_" + tname + "_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "8"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+    }
 }
 
 void process_shaders() {

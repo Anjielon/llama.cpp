@@ -2192,9 +2192,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #define FOR_EACH_LUT_FP4_TYPE(X) \
     X(GGML_TYPE_MXFP4,   mxfp4)   \
     X(GGML_TYPE_NVFP4,   nvfp4)
+// TQ1_0R_1024 and its packed planes: weights decoded in the rotated domain, B rotated by the caller
+#define FOR_EACH_TQ1R_TYPE(X) \
+    X(GGML_TYPE_TQ1_0R_1024,    tq1_0r_1024)    \
+    X(GGML_TYPE_TQ1_0R_1024_X2, tq1_0r_1024_x2) \
+    X(GGML_TYPE_TQ1_0R_1024_X3, tq1_0r_1024_x3) \
+    X(GGML_TYPE_TQ1_0R_1024_X4, tq1_0r_1024_x4)
 #define FOR_EACH_LUT_TYPE(X) \
     FOR_EACH_LUT_TYPE_NONFP4(X)  \
-    FOR_EACH_LUT_FP4_TYPE(X)
+    FOR_EACH_LUT_FP4_TYPE(X)     \
+    FOR_EACH_TQ1R_TYPE(X)
 
     const int mul_mat_id_param_count = 5;
 
@@ -2458,6 +2465,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create({TYPE, GGML_TYPE_F16, false, false}, tc_mmq, "matmul_" #tstr "_f16",        matmul_##tstr##_f16_cm1_len,        matmul_##tstr##_f16_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
         }
         FOR_EACH_LUT_TYPE_NONFP4(X_CM1)
+        FOR_EACH_TQ1R_TYPE(X_CM1)
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM1_OCP(TYPE, tstr) \
@@ -2531,6 +2539,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create({TYPE, GGML_TYPE_F16, true, false}, tc_mmq_id, "matmul_id_subgroup_" #tstr "_f16",        matmul_id_subgroup_##tstr##_f16_cm1_len,        matmul_id_subgroup_##tstr##_f16_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
         }
         FOR_EACH_LUT_TYPE_NONFP4(X_CM1_ID)
+        FOR_EACH_TQ1R_TYPE(X_CM1_ID)
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM1_ID_OCP(TYPE, tstr) \
@@ -2789,6 +2798,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 #undef FOR_EACH_LUT_TYPE
 #undef FOR_EACH_LUT_TYPE_NONFP4
+#undef FOR_EACH_TQ1R_TYPE
 #undef FOR_EACH_LUT_FP4_TYPE
     // BF16 fallback for coopmat devices without bf16 coopmat support
     if ((device->coopmat2 || device->coopmat_support)
@@ -6488,12 +6498,26 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
 }
 
 // perf-heuristic for choosing mul_mat b type, based on shader availability
+static bool ggml_vk_tq1r_rotates_y(ggml_type type);
+static void ggml_vk_tq1r_rotate_y(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src1, vk_pipeline & to_f32,
+                                  const vk_subbuffer & d_Qy, const vk_subbuffer & d_Y, uint64_t y_ne, bool y_non_contig, bool q8);
+// TQ1_0R_1024 batched mul_mat in the rotated domain (weights decoded in mul_mm, B rotated first); GGML_VK_TQ1R_MM=0 keeps
+// the dequantize-to-f16 path
+static bool ggml_vk_tq1r_mm_enabled() {
+    static const bool on = []() { const char * e = getenv("GGML_VK_TQ1R_MM"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
 static ggml_type ggml_vk_mul_mat_b_type(
         ggml_backend_vk_context * ctx, ggml_type src0_type, const ggml_tensor * src1,
         ggml_type f16_type, ggml_prec prec, bool mul_mat_id, bool can_quantize_y, bool prefer_f16_b) {
     auto available = [&](ggml_type b) {
         return ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0_type, b, prec, mul_mat_id) != nullptr;
     };
+    if (ggml_vk_tq1r_rotates_y(src0_type) && ggml_vk_tq1r_mm_enabled()) {
+        // B is rotated in f32 before the matmul
+        return (src1->type == GGML_TYPE_F32 && available(GGML_TYPE_F32)) ? GGML_TYPE_F32 : f16_type;
+    }
     if (can_quantize_y && available(GGML_TYPE_Q8_1))             return GGML_TYPE_Q8_1;
     if (prefer_f16_b   && available(f16_type))                   return f16_type;
     if (ggml_vk_dim01_contiguous(src1) && available(src1->type)) return src1->type;
@@ -6566,8 +6590,22 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst));
 
+    // TQ1_0R_1024: the matmul decodes the weights in the rotated domain, so B is rotated into prealloc_y first;
+    // any other case dequantizes the weights (which undoes the rotation) as before
+    const bool tq1r_rot = ggml_vk_tq1r_rotates_y(src0->type) && ggml_vk_tq1r_mm_enabled() && mmp_map != nullptr && !x_non_contig &&
+                          y_kernel_type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ne10 % 1024 == 0;
+    if (ggml_vk_tq1r_rotates_y(src0->type) && getenv("GGML_VK_TQ1R_DEBUG")) {
+        static int n_dbg = 0;
+        if (n_dbg++ < 4) {
+            fprintf(stderr, "tq1r mm: type=%s rot=%d map=%d ykt=%s\n", ggml_type_name(src0->type), (int)tq1r_rot, (int)(mmp_map != nullptr), ggml_type_name(y_kernel_type));
+        }
+    }
+    if (ggml_vk_tq1r_rotates_y(src0->type) && !tq1r_rot) {
+        mmp_map = nullptr;
+    }
+
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
-    const bool qy_needs_dequant = y_needs_reformat;
+    const bool qy_needs_dequant = y_needs_reformat || tq1r_rot;
 
     if (qx_needs_dequant) {
         // dequant src0 to f16
@@ -6615,7 +6653,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
     GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
-    GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
+    GGML_ASSERT(!qy_needs_dequant || tq1r_rot || to_fp16_vk_1 != nullptr);  // NOLINT
 
     if (quantize_y) {
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
@@ -6647,7 +6685,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
         }
         if (qy_needs_dequant) {
-            ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_1, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, tq1r_rot ? ctx->device->pipeline_rot_y_tq1_0r_1024_f32 : to_fp16_vk_1, 1);
         }
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
@@ -6708,6 +6746,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)(x_ne), 1, 1});
         ggml_vk_sync_buffers(ctx, subctx);
     }
+    if (tq1r_rot) {
+        if (ctx->prealloc_y_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_vk_tq1r_rotate_y(ctx, subctx, src1, to_fp16_vk_1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0),
+                              ne10 * ne11 * ne12 * ne13, false, false);
+    } else
     if (y_needs_reformat) {
         if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
             ctx->prealloc_y_last_tensor_used != src1 ||
@@ -6770,7 +6815,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (x_non_contig || qx_needs_dequant) {
         ctx->prealloc_x_need_sync = true;
     }
-    if (y_needs_reformat || quantize_y) {
+    if (y_needs_reformat || quantize_y || tq1r_rot) {
         ctx->prealloc_y_need_sync = true;
     }
 }
@@ -6867,6 +6912,7 @@ static bool ggml_vk_tq_no_mul_mm(ggml_type type) {
         case GGML_TYPE_TQ1_0R_1024_X2:
         case GGML_TYPE_TQ1_0R_1024_X3:
         case GGML_TYPE_TQ1_0R_1024_X4:
+            return !ggml_vk_tq1r_mm_enabled();
         case GGML_TYPE_TQ1_0_X2:
         case GGML_TYPE_TQ1_0_X3:
         case GGML_TYPE_TQ1_0_X4:
@@ -7730,6 +7776,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst), true);
 
+    // TQ1_0R_1024: experts decoded in the rotated domain, B rotated into prealloc_y first (see ggml_vk_mul_mat_q_f16)
+    const bool tq1r_rot = ggml_vk_tq1r_rotates_y(src0->type) && ggml_vk_tq1r_mm_enabled() && mmp_map != nullptr && !x_non_contig &&
+                          !ctx->device->coopmat2 && y_kernel_type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                          ggml_is_contiguous(src1) && ne10 % 1024 == 0;
+    if (ggml_vk_tq1r_rotates_y(src0->type) && getenv("GGML_VK_TQ1R_DEBUG")) {
+        static int n_dbg = 0;
+        if (n_dbg++ < 4) {
+            fprintf(stderr, "tq1r id: type=%s rot=%d map=%d xnc=%d ykt=%s src1=%s contig=%d ne10=%d cm2=%d\n", ggml_type_name(src0->type), (int)tq1r_rot,
+                    (int)(mmp_map != nullptr), (int)x_non_contig, ggml_type_name(y_kernel_type), ggml_type_name(src1->type), (int)ggml_is_contiguous(src1), (int)ne10, (int)ctx->device->coopmat2);
+        }
+    }
+    if (ggml_vk_tq1r_rotates_y(src0->type) && !tq1r_rot) {
+        mmp_map = nullptr;
+    }
+
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
 
     if (qx_needs_dequant) {
@@ -7745,7 +7806,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type ||
                                                   y_decode_vector_staging || y_needs_k_padding);
-    const bool qy_needs_dequant = y_needs_reformat;
+    const bool qy_needs_dequant = y_needs_reformat || tq1r_rot;
 
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
@@ -7802,7 +7863,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
     GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
-    GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
+    GGML_ASSERT(!qy_needs_dequant || tq1r_rot || to_fp16_vk_1 != nullptr);  // NOLINT
 
     if (quantize_y) {
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
@@ -7836,7 +7897,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
         }
         if (qy_needs_dequant) {
-            ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_1, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, tq1r_rot ? ctx->device->pipeline_rot_y_tq1_0r_1024_f32 : to_fp16_vk_1, 1);
         }
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
@@ -7918,6 +7979,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0,
             { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)x_ne, 1, 1});
     }
+    if (tq1r_rot) {
+        if (ctx->prealloc_y_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_vk_tq1r_rotate_y(ctx, subctx, src1, to_fp16_vk_1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0),
+                              ne10 * ne11 * ne12 * ne13, false, false);
+    } else
     if (y_needs_reformat) {
         if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
             ctx->prealloc_y_last_tensor_used != src1 ||
@@ -7990,7 +8058,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     if (x_non_contig || qx_needs_dequant) {
         ctx->prealloc_x_need_sync = true;
     }
-    if (y_needs_reformat || quantize_y) {
+    if (y_needs_reformat || quantize_y || tq1r_rot) {
         ctx->prealloc_y_need_sync = true;
     }
     ctx->prealloc_split_k_need_sync = true;
