@@ -39,7 +39,12 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
+#ifdef MUL_MAT_ID
+    // a skipped slot (id -1) reads nothing: the row is zeroed by reduce_result
+    const uint nitems = expert_skip ? 0u : num_rows * nwr;
+#else
     const uint nitems = num_rows * nwr;
+#endif
     for (uint g = tid; g < nitems; g += BLOCK_SIZE) {
         const uint n   = g / nwr;
         const uint f   = g - n * nwr;
