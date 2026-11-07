@@ -528,6 +528,72 @@ uint tq_pow3(const uint t) {
     return t == 0u ? 1u : (t == 1u ? 3u : (t == 2u ? 9u : (t == 3u ? 27u : 81u)));
 }
 
+#if defined(TQ_GROUP_LOAD)
+// Group load: one prefetch covers a whole 256-weight group (8 K sub-blocks of 32) and every packed byte is read
+// once: the 4 threads of a row each keep 8 qs bytes of the first region (digits 0..4 -> sub-blocks 0..4), 8 of
+// the second (two digits each -> sub-blocks 5..7) and, for threads 2 and 3, the qh word (sub-block 7). The
+// per-block path reads each byte once per digit, i.e. up to 5 times. The raw words stay in registers and
+// STORE_BLOCK_TO_LDS decodes the BK_STEP sub-blocks of each iteration (digit chosen by value, no dynamic index).
+struct block_a_prefetch {
+    uint32_t w[5 * PACKED_K];   // wa0, wa1, wb0, wb1, wq
+    vec2 d[PACKED_K];           // scale of sub-blocks 0..3 and 4..7
+};
+
+block_a_prefetch block_a_load_group(uint ib, uint loadr) {
+    block_a_prefetch blk;
+#if defined(DATA_A_TQ1_0)
+    const uint ib_k = ib / 8u;
+#else
+    const uint ib_k = ib / 32u;
+    const uint q = (ib % 32u) >> 3;
+#endif
+    const uint r2 = loadr & 1u;
+    [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+        const uint bi = ib_k * PACKED_K + pk;
+#if defined(DATA_A_TQ1_0)
+        blk.w[5u * pk     ] = pack32(u16vec2(data_a_tq16[bi].qs[4u * loadr     ], data_a_tq16[bi].qs[4u * loadr + 1u]));
+        blk.w[5u * pk + 1u] = pack32(u16vec2(data_a_tq16[bi].qs[4u * loadr + 2u], data_a_tq16[bi].qs[4u * loadr + 3u]));
+        blk.w[5u * pk + 2u] = pack32(u16vec2(data_a_tq16[bi].qs[16u + 4u * r2     ], data_a_tq16[bi].qs[16u + 4u * r2 + 1u]));
+        blk.w[5u * pk + 3u] = pack32(u16vec2(data_a_tq16[bi].qs[16u + 4u * r2 + 2u], data_a_tq16[bi].qs[16u + 4u * r2 + 3u]));
+        blk.w[5u * pk + 4u] = pack32(u16vec2(data_a_tq16[bi].qh[0], data_a_tq16[bi].qh[1]));
+        blk.d[pk] = vec2((loadr == 0u) ? float(data_a_tq16[bi].d) : 0.0);
+#else
+        blk.w[5u * pk     ] = data_a_tq32[bi].qs[q * 12u + 2u * loadr];
+        blk.w[5u * pk + 1u] = data_a_tq32[bi].qs[q * 12u + 2u * loadr + 1u];
+        blk.w[5u * pk + 2u] = data_a_tq32[bi].qs[q * 12u + 8u + 2u * r2];
+        blk.w[5u * pk + 3u] = data_a_tq32[bi].qs[q * 12u + 8u + 2u * r2 + 1u];
+        blk.w[5u * pk + 4u] = data_a_tq32[bi].qh[q];
+        blk.d[pk] = (loadr == 0u) ? unpackHalf2x16(data_a_tq32[bi].d[q]) : vec2(0.0);
+#endif
+    }
+    return blk;
+}
+
+// decodes and stores the BK_STEP sub-blocks of the iteration at K offset blk_k
+void block_a_group_to_shmem(block_a_prefetch blk, uint buf_ib, uint loadr, uint end_k_, uint blk_k) {
+    const bool upper = loadr >= 2u;
+    [[unroll]] for (uint ks = 0u; ks < BK_STEP; ++ks) {
+        const uint sb = ((blk_k & 255u) >> 5) + ks;   // sub-block 0..7 of the group
+        const bool in_bounds = blk_k + ks * BK < end_k_;
+        // sub-blocks 0..4: digit sb of the first region; 5, 6: digits 2 (sb - 5) + upper of the second region;
+        // 7: digit 4 of the second region (threads 0, 1) or digits 2 (loadr - 2), + 1 of qh (threads 2, 3)
+        const bool first = sb < 5u;
+        const bool qh    = sb == 7u && upper;
+        const uint t     = first ? sb : (sb == 7u ? 4u : 2u * (sb - 5u) + (upper ? 1u : 0u));
+        const uint m0    = qh ? (loadr == 3u ? 9u : 1u) : tq_pow3(t);
+        const uint m1    = qh ? m0 * 3u : m0;
+        [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+            const uint w0 = qh ? blk.w[5u * pk + 4u] : (first ? blk.w[5u * pk] : blk.w[5u * pk + 2u]);
+            const uint w1 = qh ? blk.w[5u * pk + 4u] : (first ? blk.w[5u * pk + 1u] : blk.w[5u * pk + 3u]);
+            buf_a_qs[pk * BM * QPITCH + buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = tq_trits4(w0, m0);
+            buf_a_qs[pk * BM * QPITCH + buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = tq_trits4(w1, m1);
+            if (loadr == 0) {
+                buf_a_d[pk * BM * BK_STEP + ks * BM + buf_ib] = in_bounds ? (sb < 4u ? blk.d[pk].x : blk.d[pk].y) : 0.0f;
+            }
+        }
+    }
+}
+#else
 struct block_a_prefetch {
     uint32_t qs[2 * PACKED_K];
     float d[PACKED_K];
@@ -595,6 +661,7 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
         }
     }
 }
+#endif // TQ_GROUP_LOAD
 
 #endif
 
@@ -645,7 +712,35 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
             const uint ib = pos_b_ib + buf_ib * p.stride_b / BK;
 #endif
 
-#define PREFETCH_BLOCK(blk)                                                                     \
+// MUL_MAT_ID: the B columns past the rows routed to this expert tile (_ne1) are neither loaded nor used
+#ifdef MUL_MAT_ID
+#define B_COL_USED(buf_ib) ((buf_ib) < _ne1)
+#else
+#define B_COL_USED(buf_ib) true
+#endif
+
+#if defined(TQ_GROUP_LOAD)
+#define A_PRE_STEPS 1
+// one group load every 256 / (BK * BK_STEP) iterations (K starts at 0 and is a multiple of 256)
+#define PREFETCH_A(blk)                                                                         \
+    if (((blk) & 255u) == 0u) {                                                                 \
+        [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                      \
+            const uint buf_ib = loadc_a + li * loadstride_a;                                    \
+            if (buf_ib < BM) {                                                                  \
+                pre_a[li] = block_a_load_group(pos_a_ib + buf_ib * p.stride_a / BK, loadr_a);   \
+            }                                                                                   \
+        }                                                                                       \
+    }
+#define STORE_A(blk)                                                                            \
+    [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
+        const uint buf_ib = loadc_a + li * loadstride_a;                                        \
+        if (buf_ib < BM) {                                                                      \
+            block_a_group_to_shmem(pre_a[li], buf_ib, loadr_a, end_k, (blk));                   \
+        }                                                                                       \
+    }
+#else
+#define A_PRE_STEPS BK_STEP
+#define PREFETCH_A(blk)                                                                         \
     [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
         if (buf_ib < BM) {                                                                      \
@@ -656,10 +751,24 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
                 pre_a[li * BK_STEP + ks] = block_a_load(ib_k, loadr_a);                         \
             }                                                                                   \
         }                                                                                       \
-    }                                                                                           \
+    }
+#define STORE_A(blk)                                                                            \
+    [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
+        const uint buf_ib = loadc_a + li * loadstride_a;                                        \
+        if (buf_ib < BM) {                                                                      \
+            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
+                const bool in_bounds = (blk) + ks * BK < end_k;                                 \
+                block_a_to_shmem(pre_a[li * BK_STEP + ks], buf_ib, ks, loadr_a, in_bounds);     \
+            }                                                                                   \
+        }                                                                                       \
+    }
+#endif
+
+#define PREFETCH_BLOCK(blk)                                                                     \
+    PREFETCH_A(blk)                                                                             \
     [[unroll]] for (uint li = 0; li < B_LOADS; li++) {                                          \
         const uint buf_ib = loadc_b + li * loadstride_b;                                        \
-        if (buf_ib < BN) {                                                                      \
+        if (buf_ib < BN && B_COL_USED(buf_ib)) {                                                \
             B_IB_CALC                                                                           \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
                 const uint ib_k = ((blk) + ks * BK < end_k) ? (ib + ks) : ib;                   \
@@ -669,20 +778,12 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     }
 
 #define STORE_BLOCK_TO_LDS(blk)                                                                 \
-    [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
-        const uint buf_ib = loadc_a + li * loadstride_a;                                        \
-        if (buf_ib < BM) {                                                                      \
-            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
-                const bool in_bounds = (blk) + ks * BK < end_k;                                 \
-                block_a_to_shmem(pre_a[li * BK_STEP + ks], buf_ib, ks, loadr_a, in_bounds);     \
-            }                                                                                   \
-        }                                                                                       \
-    }                                                                                           \
+    STORE_A(blk)                                                                                \
     [[unroll]] for (uint li = 0; li < B_LOADS; li++) {                                          \
         const uint buf_ib = loadc_b + li * loadstride_b;                                        \
         if (buf_ib < BN) {                                                                      \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
-                const bool in_bounds = (blk) + ks * BK < end_k;                                 \
+                const bool in_bounds = (blk) + ks * BK < end_k && B_COL_USED(buf_ib);           \
                 block_b_to_shmem(pre_b[li * BK_STEP + ks], buf_ib, ks, loadr_b, in_bounds);     \
             }                                                                                   \
         }                                                                                       \

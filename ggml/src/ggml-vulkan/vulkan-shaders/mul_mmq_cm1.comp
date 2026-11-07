@@ -100,6 +100,11 @@ layout (constant_id = 11) const uint DEVICE_ARCH = 0; // vk_device_architecture 
 #else
 #define BK_STEP 4
 #endif
+// ternary types: read every packed byte once per 256-weight group (mul_mmq_cm1_funcs.glsl). Needs K ranges
+// aligned to 256: K is a multiple of the block size and split_k rounds k_split up to 256.
+#if (defined(DATA_A_TQ1_0) || defined(DATA_A_TQ1_0R_1024)) && !defined(TQ_NO_GROUP_LOAD)
+#define TQ_GROUP_LOAD 1
+#endif
 #define GROUP_A_BUDGET (16u * 1024u * 1024u)
 
 const uint QPITCH = BK_STEP * (BK / 4) + 4;
@@ -276,7 +281,7 @@ void main() {
     const uint A_LOADS = (BM + loadstride_a - 1) / loadstride_a;
     const uint B_LOADS = (BN + loadstride_b - 1) / loadstride_b;
 
-    block_a_prefetch pre_a[A_LOADS * BK_STEP];
+    block_a_prefetch pre_a[A_LOADS * A_PRE_STEPS];
     block_b_prefetch pre_b[B_LOADS * BK_STEP];
 
     if (start_k < end_k) {

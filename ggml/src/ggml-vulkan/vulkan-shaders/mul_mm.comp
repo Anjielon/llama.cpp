@@ -93,6 +93,9 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 #if defined(A_TYPE_PACKED32)
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
 #endif
+#if defined(DATA_A_TQ1_0R_1024)
+layout (binding = 0) readonly buffer A_TQ32 {block_tq1_0r_1024_packed32 data_a_tq32[];};
+#endif
 #else
 // Unpacked struct aliases
 layout (binding = 0) readonly buffer BUF_Q1_0     { block_q1_0 data[];     } a_q1_0;
