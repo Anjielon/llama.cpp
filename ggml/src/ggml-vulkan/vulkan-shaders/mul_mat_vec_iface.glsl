@@ -4,6 +4,9 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// MUL_MAT_ID of the ternary types: residual expert plane fused in, Fuse0 = W2 (raw blocks), Fuse1 = map
+// (F32, expert -> W2 slot, -1 = none)
+#define MAT_VEC_FUSION_FLAGS_RES 0x10
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)

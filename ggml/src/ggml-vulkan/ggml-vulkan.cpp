@@ -8227,8 +8227,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     ctx->prealloc_split_k_need_sync = true;
 }
 
-static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    ggml_tensor * dst = cgraph->nodes[node_idx];
+// mm: the MUL_MAT_ID node when it is not cgraph->nodes[node_idx] (fused residual plane, ctx->fused_mmid_res)
+static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                         ggml_tensor * mm = nullptr) {
+    ggml_tensor * dst = mm != nullptr ? mm : cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * ids = dst->src[2];
@@ -8428,7 +8430,14 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     uint32_t fusion_flags = 0;
 
-    if (ctx->num_additional_fused_ops > 0) {
+    vk_subbuffer d_F1 = d_D;
+    if (ctx->fused_mmid_res) {
+        // residual expert plane: W2 and the map in the two fusion bindings
+        const ggml_tensor * mm2 = cgraph->nodes[node_idx + (ctx->fused_mmid_res_swapped ? 0 : 1)];
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, mm2->src[0]);
+        d_F1 = ggml_vk_tensor_subbuffer(ctx, ctx->fused_mmid_res_map);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_RES;
+    } else if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * bias = cgraph->nodes[node_idx + 1]->src[1];
 
         d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
@@ -8441,8 +8450,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         }
     }
 
-    vk_subbuffer d_F1 = d_D;
-    if (ctx->num_additional_fused_ops > 1) {
+    if (!ctx->fused_mmid_res && ctx->num_additional_fused_ops > 1) {
         const ggml_tensor * scale = cgraph->nodes[node_idx + 2]->src[1];
 
         d_F1 = ggml_vk_tensor_subbuffer(ctx, scale);
@@ -8565,8 +8573,12 @@ static const ggml_tensor * ggml_vk_mmid_res_map(ggml_backend_vk_context * ctx, c
         w2->ne[0] != w->ne[0] || w2->ne[1] != w->ne[1] || w2->nb[1] != w->nb[1] || w2->nb[2] != w->nb[2] ||
         !ggml_vk_dim01_contiguous(w2) || get_misalign_bytes(ctx, w2) != 0 ||
         mm2->src[1] != mm->src[1] || !ggml_are_same_shape(mm, mm2) || !ggml_are_same_shape(add, mm) ||
-        add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || get_misalign_bytes(ctx, add) != 0 ||
-        !ggml_vk_mmid_int8_ok(ctx, mm)) {
+        add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || get_misalign_bytes(ctx, add) != 0) {
+        return nullptr;
+    }
+    // batched: int8 path with the MUL_MAT_ID_RES pipelines; mat-vec: the TQ1 mat-vec shaders (MAT_VEC_FUSION_FLAGS_RES)
+    const bool vec = ggml_vk_use_mul_mat_vec_id(mm);
+    if (!vec && !ggml_vk_mmid_int8_ok(ctx, mm)) {
         return nullptr;
     }
     // ids2 = cast(reshape(get_rows(repeat(reshape(map)), ids))): walk it back to the map
@@ -8595,7 +8607,7 @@ static const ggml_tensor * ggml_vk_mmid_res_map(ggml_backend_vk_context * ctx, c
     if (t->src[1] != mm->src[2] && !(ggml_are_same_layout(t->src[1], mm->src[2]) && t->src[1]->data == mm->src[2]->data)) {
         return nullptr;
     }
-    if (ggml_vk_get_mul_mat_mat_pipeline_map(ctx, w->type, GGML_TYPE_Q8_1, ggml_prec_get_acc(mm), true, true) == nullptr) {
+    if (!vec && ggml_vk_get_mul_mat_mat_pipeline_map(ctx, w->type, GGML_TYPE_Q8_1, ggml_prec_get_acc(mm), true, true) == nullptr) {
         return nullptr;
     }
     return map;
@@ -8617,8 +8629,12 @@ void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 fprintf(stderr, "mmid+res fused: %s swapped=%d\n", ggml_type_name(mm->src[0]->type), (int)ctx->fused_mmid_res_swapped);
             }
         }
-        ggml_vk_mul_mat_id_q_f16(ctx, subctx, mm->src[0], mm->src[1], mm->src[2], cgraph->nodes[node_idx + 2], false,
-                                 mm2->src[0], ctx->fused_mmid_res_map);
+        if (ggml_vk_use_mul_mat_vec_id(mm)) {
+            ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx, const_cast<ggml_tensor *>(mm));
+        } else {
+            ggml_vk_mul_mat_id_q_f16(ctx, subctx, mm->src[0], mm->src[1], mm->src[2], cgraph->nodes[node_idx + 2], false,
+                                     mm2->src[0], ctx->fused_mmid_res_map);
+        }
         return;
     }
     if (ctx->fused_mmid_add_acc) {
@@ -15678,8 +15694,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // MUL_MAT_ID + residual plane MUL_MAT_ID + ADD (ggml_vk_mmid_res_map): keep the three together
         auto const &is_tq_mmid_res = [&](int n) -> bool {
             return match_pattern({ GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_ADD }, n) &&
-                   ggml_vk_is_tq_type(graph->nodes[n]->src[0]->type) &&
-                   !ggml_vk_use_mul_mat_vec_id(graph->nodes[n]) &&
+                   (graph->nodes[n]->src[0]->type == GGML_TYPE_TQ1_0 || graph->nodes[n]->src[0]->type == GGML_TYPE_TQ1_0R_1024) &&
                    graph->nodes[n + 1]->src[1] == graph->nodes[n]->src[1] &&
                    ((graph->nodes[n + 2]->src[0] == graph->nodes[n] && graph->nodes[n + 2]->src[1] == graph->nodes[n + 1]) ||
                     (graph->nodes[n + 2]->src[1] == graph->nodes[n] && graph->nodes[n + 2]->src[0] == graph->nodes[n + 1]));

@@ -1107,6 +1107,8 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// mul_mat_vec_tq1_0*.comp MUL_MAT_ID: residual expert plane fused in (Fuse0 = W2, Fuse1 = map)
+#define MAT_VEC_FUSION_FLAGS_RES 0x10
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
