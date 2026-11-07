@@ -799,6 +799,9 @@ struct vk_device_struct {
     // TQ1_0R_1024 mat-vec pipelines with fewer rows per workgroup than the default one, keyed by the default
     // pipeline (slot i = 1 << i rows)
     std::unordered_map<const vk_pipeline_struct *, std::array<vk_pipeline, 4>> pipeline_dmmv_tq1r_rows;
+    // int8 variant of the TQ1_0R_1024 mat-vec (GGML_VK_TQ1R_Q8=1), by float pipeline
+    std::unordered_map<const vk_pipeline_struct *, vk_pipeline> pipeline_dmmv_tq1r_q8;
+    vk_pipeline pipeline_rot_q8_tq1r;
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];

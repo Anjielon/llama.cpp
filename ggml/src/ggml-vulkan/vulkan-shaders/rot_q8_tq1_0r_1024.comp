@@ -1,0 +1,105 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "tq1_0r_1024_common.glsl"
+
+// MOGAVIS velocita' (3/10/2026): ruota l'attivazione come rot_y_tq1_0r_1024.comp
+// (y' = (1/32) H_1024 (S1024 ⊙ y)) e la QUANTIZZA a int8 nell'ordine dei BYTE del
+// peso TQ1_0R_1024, per mul_mat_vec_tq1_0r_1024_q8.comp (prodotto a 4 int8).
+// Una scala per quarto (256 elementi): dopo la rotazione di Hadamard l'attivazione
+// non ha valori anomali, e tutti e 5 gli elementi di un byte del peso stanno nello
+// stesso quarto, quindi un prodotto int8 x int8 non mescola scale diverse.
+//
+// Uscita per colonna e per blocco di 1024 (264 uint):
+//   [0, 208)   Y4[s]: per lo slot-byte s (= parola ws*4 + byte k del peso), i 4 int8
+//              degli elementi delle cifre t = 0..3 (byte t);
+//   [208, 260) Y4b[ws]: per la parola ws, i 4 int8 della cifra t = 4 dei 4 byte
+//              (byte k; zero per le parole qh, che hanno 4 cifre);
+//   [260, 264) scala float (bit) del quarto q.
+// Geometria dei byte: tq1_0r_1024_slot()/locate() di tq1_0r_1024_common.glsl.
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) writeonly buffer D {uint data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne;
+} p;
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared float sh[1024];
+shared float red[256];
+
+int q8(const float v, const float inv) {
+    return clamp(int(round(v * inv)), -127, 127);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nblk = p.ne / 1024u;
+    for (uint blk = gl_WorkGroupID.x; blk < nblk; blk += gl_NumWorkGroups.x) {
+        const uint base = blk * 1024u;
+        for (uint e = tid; e < 1024u; e += 256u) {
+            sh[e] = data_a[base + e] * (tq1_0r_1024_sign(e) * 0.03125);
+        }
+        barrier();
+        for (uint s = 0u; s < 10u; ++s) {
+            const uint len = 1u << s;
+            for (uint pi = tid; pi < 512u; pi += 256u) {
+                const uint i = ((pi >> s) << (s + 1u)) | (pi & (len - 1u));
+                const uint j = i | len;
+                const float u = sh[i];
+                const float w = sh[j];
+                sh[i] = u + w;
+                sh[j] = u - w;
+            }
+            barrier();
+        }
+        // massimo assoluto per quarto: il thread tid guarda gli elementi 4tid..4tid+3 (quarto tid/64)
+        red[tid] = max(max(abs(sh[4u * tid]), abs(sh[4u * tid + 1u])), max(abs(sh[4u * tid + 2u]), abs(sh[4u * tid + 3u])));
+        barrier();
+        for (uint st = 32u; st > 0u; st >>= 1) {
+            if ((tid & 63u) < st) {
+                red[tid] = max(red[tid], red[tid + st]);
+            }
+            barrier();
+        }
+        const uint ob = blk * 264u;
+        if (tid < 208u) {
+            const uint ws = tid >> 2, k = tid & 3u;
+            const uint q = ws / 13u, r = ws - q * 13u;
+            uint e0, es;
+            if (r < 8u)       { e0 = q * 256u + 4u * r + k;               es = 32u; }
+            else if (r < 12u) { e0 = q * 256u + 160u + 4u * (r - 8u) + k; es = 16u; }
+            else              { e0 = q * 256u + 240u + k;                 es = 4u;  }
+            const float amax = red[q * 64u];
+            const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+            uint pk = 0u;
+            [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+                pk |= (uint(q8(sh[e0 + t * es], inv)) & 255u) << (8u * t);
+            }
+            data_d[ob + tid] = pk;
+        }
+        if (tid < 52u) {
+            const uint ws = tid;
+            const uint q = ws / 13u, r = ws - q * 13u;
+            const float amax = red[q * 64u];
+            const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+            uint pk = 0u;
+            if (r < 12u) {
+                [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                    const uint e = (r < 8u) ? (q * 256u + 4u * r + k + 4u * 32u) : (q * 256u + 160u + 4u * (r - 8u) + k + 4u * 16u);
+                    pk |= (uint(q8(sh[e], inv)) & 255u) << (8u * k);
+                }
+            }
+            data_d[ob + 208u + ws] = pk;
+        }
+        if (tid < 4u) {
+            data_d[ob + 260u + tid] = floatBitsToUint(red[tid * 64u] / 127.0);
+        }
+        barrier();   // il prossimo blocco (grid-stride) riusa sh[] e red[]
+    }
+}

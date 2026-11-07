@@ -867,6 +867,18 @@ void process_shaders() {
             string_to_spv(pfx + tname + "_f32_f32_subgroup", mmv, merge_maps(d, {{"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv(pfx + tname + "_f32_f32_subgroup_no_shmem", mmv, merge_maps(d, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         }
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        if (r1024) { // int8 dot products, activation from rot_q8_tq1_0r_1024.comp
+            const std::map<std::string, std::string> qd = merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "uint"}, {"D_TYPE", "float"}});
+            for (const std::string pfx : {"mul_mat_vec_", "mul_mat_vec_id_"}) {
+                const std::map<std::string, std::string> d = pfx == std::string("mul_mat_vec_id_") ? merge_maps(qd, {{"MUL_MAT_ID", "1"}}) : qd;
+                const std::string nm = pfx + tname + "_q8_f32";
+                string_to_spv(nm, "mul_mat_vec_tq1_0r_1024_q8.comp", d);
+                string_to_spv(nm + "_subgroup", "mul_mat_vec_tq1_0r_1024_q8.comp", merge_maps(d, {{"USE_SUBGROUP_ADD", "1"}}));
+                string_to_spv(nm + "_subgroup_no_shmem", "mul_mat_vec_tq1_0r_1024_q8.comp", merge_maps(d, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            }
+        }
+#endif
         if (r1024) {
             string_to_spv("dequant_" + tname, "dequant_tq1_0r_1024.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
         } else {
@@ -877,6 +889,9 @@ void process_shaders() {
     }
     // activation rotation of the TQ1_0R_1024 types
     string_to_spv("rot_y_tq1_0r_1024_f32", "rot_y_tq1_0r_1024.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    string_to_spv("rot_q8_tq1_0r_1024", "rot_q8_tq1_0r_1024.comp", {});
+#endif
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
 
@@ -1369,6 +1384,23 @@ void write_output_files() {
         src << len.str();
     }
 
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    for (const auto& tname : tq_plane_type_names) {
+        if (!string_starts_with(tname, "tq1_0r_1024")) {
+            continue;
+        }
+        for (const std::string pfx : {"", "id_"}) {
+            const std::string arr = "arr_dmmv_" + pfx + tname + "_q8_f32";
+            const std::string nm  = "mul_mat_vec_" + pfx + tname + "_q8_f32";
+            hdr << "extern const void * " << arr << "_data[3];\n";
+            hdr << "extern const uint64_t " << arr << "_len[3];\n";
+            if (basename(input_filepath) == "mul_mat_vec_tq1_0r_1024_q8.comp") {
+                src << "const void * " << arr << "_data[3] = {" << nm << "_data, " << nm << "_subgroup_data, " << nm << "_subgroup_no_shmem_data};\n";
+                src << "const uint64_t " << arr << "_len[3] = {" << nm << "_len, " << nm << "_subgroup_len, " << nm << "_subgroup_no_shmem_len};\n";
+            }
+        }
+    }
+#endif
     for (const auto& tname : tq_plane_type_names) {
         for (const std::string pfx : {"", "id_"}) {
             const std::string arr = "arr_dmmv_" + pfx + tname + "_f32_f32";

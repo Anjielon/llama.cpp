@@ -2072,6 +2072,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    // residual expert planes: the maps of a layer are often equal, sharing the tensor lets the graph share mask and ids
+    for (auto & layer : layers) {
+        ggml_tensor * maps[3] = { layer.ffn_up_exps2_map, layer.ffn_gate_exps2_map, layer.ffn_down_exps2_map };
+        ggml_tensor * first = nullptr;
+        std::vector<float> a, b;
+        for (ggml_tensor * m : maps) {
+            if (!m) {
+                continue;
+            }
+            if (!first) {
+                first = m;
+                a.resize(ggml_nelements(first));
+                ggml_backend_tensor_get(first, a.data(), 0, ggml_nbytes(first));
+                continue;
+            }
+            if (ggml_nelements(m) != ggml_nelements(first)) {
+                first = nullptr;
+                break;
+            }
+            b.resize(ggml_nelements(m));
+            ggml_backend_tensor_get(m, b.data(), 0, ggml_nbytes(m));
+            if (memcmp(a.data(), b.data(), ggml_nbytes(m)) != 0) {
+                first = nullptr;
+                break;
+            }
+        }
+        if (first) {
+            if (layer.ffn_up_exps2_map)   { layer.ffn_up_exps2_map   = first; }
+            if (layer.ffn_gate_exps2_map) { layer.ffn_gate_exps2_map = first; }
+            if (layer.ffn_down_exps2_map) { layer.ffn_down_exps2_map = first; }
+        }
+    }
     return true;
 }
 
