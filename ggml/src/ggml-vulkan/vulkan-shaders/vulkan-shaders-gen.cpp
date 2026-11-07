@@ -644,7 +644,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 #endif
 
         if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
-                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
+                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4" || tname == "tq1_0")) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
         }
 
@@ -693,7 +693,20 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
     // TQ1_0R_1024 and its packed planes: weights decoded in the rotated domain (load_a_to_shmem in mul_mm_funcs.glsl),
     // the caller rotates B with rot_y_tq1_0r_1024.comp first
     for (const auto& tname : tq_plane_type_names) {
-        if (!string_starts_with(tname, "tq1_0r_1024") || coopmat2) {
+        if (coopmat2) {
+            continue;
+        }
+        if (!string_starts_with(tname, "tq1_0r_1024")) {
+            // packed TQ1_0 planes: int8 coopmat path only
+            if (!f16acc && coopmat) {
+                const std::map<std::string, std::string> ftd = {
+                    {"FLOAT_TYPE",   FLOAT_TYPE(1, tname)},
+                    {"FLOAT_TYPEV2", FLOAT_TYPE(2, tname)},
+                    {"FLOAT_TYPEV4", FLOAT_TYPE(4, tname)},
+                    {"FLOAT_TYPEV8", FLOAT_TYPE(8, tname)},
+                };
+                string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, ftd), {{"DATA_A_" + to_uppercase(tname), "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
+            }
             continue;
         }
         const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
@@ -705,6 +718,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         };
         string_to_spv(shader_name + "_" + tname + "_f16" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "8"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
         string_to_spv(shader_name + "_" + tname + "_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", "8"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+        // int8 coopmat path: B rotated and quantized to q8_1 by rot_q8_1_tq1_0r_1024.comp
+        if (!f16acc && coopmat) {
+            string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
+        }
     }
 }
 
@@ -908,6 +925,7 @@ void process_shaders() {
     string_to_spv("rot_y_tq1_0r_1024_f32", "rot_y_tq1_0r_1024.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     string_to_spv("rot_q8_tq1_0r_1024", "rot_q8_tq1_0r_1024.comp", {});
+    string_to_spv("rot_q8_1_tq1_0r_1024", "rot_q8_1_tq1_0r_1024.comp", {});
 #endif
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});

@@ -11247,6 +11247,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 512, n, 2048));
         }
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, true, 512, 5, 2048));
+        // int8 matmul: partial tiles in m and n, odd k block count, batch broadcast
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, 67, 3072, {2, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 200, 67, 3072));
     }
     // packed multi-plane TQ1_0
     for (ggml_type type_a : {GGML_TYPE_TQ1_0_X2, GGML_TYPE_TQ1_0_X3, GGML_TYPE_TQ1_0_X4}) {
@@ -11260,6 +11263,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int n : {1, 9}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 2048, n, 512));
         }
+    }
+    // int8 matmul of the ternary types: partial tiles in m and n, odd block count in k
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0, GGML_TYPE_TQ1_0_X2, GGML_TYPE_TQ1_0_X3, GGML_TYPE_TQ1_0_X4}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, 67, 768, {2, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 200, 67, 768));
     }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above

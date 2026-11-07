@@ -802,6 +802,7 @@ struct vk_device_struct {
     // int8 variant of the TQ1_0R_1024 mat-vec (GGML_VK_TQ1R_Q8=1), by float pipeline
     std::unordered_map<const vk_pipeline_struct *, vk_pipeline> pipeline_dmmv_tq1r_q8;
     vk_pipeline pipeline_rot_q8_tq1r;
+    vk_pipeline pipeline_rot_q8_1_tq1r;  // rotate + quantize to q8_1 x4 for the TQ1_0R_1024 int8 matmul
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];

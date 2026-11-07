@@ -1,0 +1,81 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+#include "tq1_0r_1024_common.glsl"
+
+// Activation side of the TQ1_0R_1024 int8 matmul (mul_mmq_cm1.comp): rotates every block of 1024 values like
+// rot_y_tq1_0r_1024.comp, y' = (1/32) H (S * y), then quantizes y' to q8_1 in the block_q8_1_x4 layout of
+// quantize_q8_1.comp (QBLOCK_X4), one scale per 32 values. One workgroup per block (grid-stride).
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) writeonly buffer D {block_q8_1_x4 data_b[];};
+
+layout (push_constant) uniform parameter {
+    uint ne;
+} p;
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared float sh[1024];
+shared float red[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nblk = p.ne / 1024u;
+    for (uint blk = gl_WorkGroupID.x; blk < nblk; blk += gl_NumWorkGroups.x) {
+        const uint base = blk * 1024u;
+        [[unroll]] for (uint e = tid; e < 1024u; e += 256u) {
+            sh[e] = data_a[base + e] * (tq1_0r_1024_sign(e) * 0.03125);
+        }
+        barrier();
+        [[unroll]] for (uint s = 0u; s < 10u; ++s) {
+            const uint len = 1u << s;
+            [[unroll]] for (uint pi = tid; pi < 512u; pi += 256u) {
+                const uint i = ((pi >> s) << (s + 1u)) | (pi & (len - 1u));
+                const uint j = i | len;
+                const float u = sh[i];
+                const float w = sh[j];
+                sh[i] = u + w;
+                sh[j] = u - w;
+            }
+            barrier();
+        }
+
+        // thread tid quantizes values 4 tid .. 4 tid + 3, i.e. 8 threads per q8_1 block of 32
+        vec4 v = vec4(sh[4u * tid], sh[4u * tid + 1u], sh[4u * tid + 2u], sh[4u * tid + 3u]);
+        const vec4 av = abs(v);
+        red[tid] = max(max(av.x, av.y), max(av.z, av.w));
+        barrier();
+        [[unroll]] for (uint st = 4u; st > 0u; st >>= 1) {
+            if ((tid & 7u) < st) {
+                red[tid] = max(red[tid], red[tid + st]);
+            }
+            barrier();
+        }
+        const float amax = red[tid & ~7u];
+        barrier();
+        const float d = amax / 127.0;
+        const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+        v = round(v * d_inv);
+
+        const uint ib = blk * 32u + (tid >> 3);   // q8_1 block of 32
+        data_b[ib >> 2].qs[(ib & 3u) * 8u + (tid & 7u)] = pack32(i8vec4(v));
+
+        red[tid] = v.x + v.y + v.z + v.w;
+        barrier();
+        [[unroll]] for (uint st = 4u; st > 0u; st >>= 1) {
+            if ((tid & 7u) < st) {
+                red[tid] += red[tid + st];
+            }
+            barrier();
+        }
+        if ((tid & 7u) == 0u) {
+            data_b[ib >> 2].ds[ib & 3u] = f16vec2(vec2(d, red[tid] * d));
+        }
+        barrier();   // the next block (grid-stride) reuses sh[] and red[]
+    }
+}
