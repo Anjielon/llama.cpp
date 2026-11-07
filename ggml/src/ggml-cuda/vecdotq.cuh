@@ -1441,3 +1441,92 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
+
+// TQ1_0 (5 trits/byte in qs[48], 4 trits/byte in qh[4], one fp16 scale per 256) and its packed multi-plane
+// variants TQ1_0_X{2,3,4} (K consecutive block_tq1_0 per block, weight = sum of the planes).
+// One call = one 32-element chunk c = iqs (0..7) of the 256-element super-block = one q8_1 block.
+//   c = 0..4 : elements 32c..32c+31   = digit c of qs[0..31]
+//   c = 5, 6 : digits 2(c-5), 2(c-5)+1 of qs[32..47] (16 elements each)
+//   c = 7    : digit 4 of qs[32..47] (elements 224..239) + digits 0..3 of qh[0..3] (240..255)
+// trit = digit - 1, so sum(trit*y) = sum(digit*y) - sum(y); both sums exact in int32.
+#define VDR_TQ1_0_Q8_1_MMVQ 1
+
+static __device__ __forceinline__ int tq1_0_digits4(const int w, const int t) {
+    const uint32_t p = t == 0 ? 1u : t == 1 ? 3u : t == 2 ? 9u : t == 3 ? 27u : 81u;
+    int r = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t b = ((uint32_t) w >> (8*k)) & 255u;
+        r |= (int) ((((b * p) & 255u) * 3u) >> 8) << (8*k);
+    }
+    return r;
+}
+
+// sum(digit*y) over chunk c of one plane
+static __device__ __forceinline__ int tq1_0_chunk_dot(const block_tq1_0 * bq, const block_q8_1 * by, const int c) {
+    int sumi = 0;
+    if (c < 5) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            sumi = ggml_cuda_dp4a(tq1_0_digits4(get_int_b2(bq->qs, i), c), get_int_b4(by->qs, i), sumi);
+        }
+    } else {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int digits;
+                if (c == 7 && h == 1) {
+                    digits = tq1_0_digits4(get_int_b2(bq->qh, 0), i);       // elements 240+4i .. 240+4i+3
+                } else {
+                    const int t = c == 7 ? 4 : 2*(c - 5) + h;
+                    digits = tq1_0_digits4(get_int_b2(bq->qs, 8 + i), t);   // bytes 32+4i .. 32+4i+3
+                }
+                sumi = ggml_cuda_dp4a(digits, get_int_b4(by->qs, 4*h + i), sumi);
+            }
+        }
+    }
+    return sumi;
+}
+
+template <int K>
+static __device__ __forceinline__ float vec_dot_tq1_0_xk_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_tq1_0 * bq = (const block_tq1_0 *) vbq + (int64_t) kbx*K;
+    const block_q8_1  * by = bq8_1 + iqs;
+    const int c = iqs;
+
+    int sumy = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sumy = ggml_cuda_dp4a(0x01010101, get_int_b4(by->qs, i), sumy);
+    }
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int pl = 0; pl < K; ++pl) {
+        sum += __half2float(bq[pl].d) * __low2float(by->ds) * (float) (tq1_0_chunk_dot(bq + pl, by, c) - sumy);
+    }
+    return sum;
+}
+
+static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_tq1_0_xk_q8_1<1>(vbq, bq8_1, kbx, iqs);
+}
+
+static __device__ __forceinline__ float vec_dot_tq1_0_x2_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_tq1_0_xk_q8_1<2>(vbq, bq8_1, kbx, iqs);
+}
+
+static __device__ __forceinline__ float vec_dot_tq1_0_x3_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_tq1_0_xk_q8_1<3>(vbq, bq8_1, kbx, iqs);
+}
+
+static __device__ __forceinline__ float vec_dot_tq1_0_x4_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_tq1_0_xk_q8_1<4>(vbq, bq8_1, kbx, iqs);
+}

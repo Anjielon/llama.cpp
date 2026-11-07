@@ -11344,6 +11344,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, 67, 768, {2, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 200, 67, 768));
     }
+    // ternary types with repeated expert ids within a row (sparse expert planes send every expert without a
+    // plane to the same slot): mat-vec (n <= 8) and batched (n > 8) paths. These types take neither the MMQ nor
+    // the MMF path, so they are not affected by [TAG_MUL_MAT_ID_DUPLICATE_ID].
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0, GGML_TYPE_TQ1_0_X2, GGML_TYPE_TQ1_0R_1024, GGML_TYPE_TQ1_0R_1024_X3}) {
+        const int64_t k = ggml_blck_size(type_a) == 256 ? 512 : 2048;
+        for (int n : {1, 8, 9, 33}) {
+            test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 16, 8, false, 256, n, k));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 16, 8, true, 256, 17, k));
+    }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
