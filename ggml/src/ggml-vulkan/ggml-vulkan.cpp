@@ -5684,13 +5684,20 @@ vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
     return ctx->device->pipeline_dequant[type];
 }
 
-// ternary TQ1 mat-vec kernels: GGML_VK_TQ_WG=large selects the 4-subgroup workgroup (tuning)
-static bool ggml_vk_tq_large_wg(ggml_type type) {
-    static const int large = []() { const char * e = getenv("GGML_VK_TQ_WG"); return e && std::string(e) == "large" ? 1 : 0; }();
+// Workgroup size of the ternary TQ1 mat-vec kernels: one subgroup by default. GGML_VK_TQ_WG=large forces the
+// 4-subgroup workgroup (tuning; on gfx1151 it gains ~7 % per op on k >= 4096 but nothing on tg128 and loses on n = 3).
+static bool ggml_vk_tq_large_wg(ggml_type type, uint32_t k, bool is_id) {
+    static const int forced = []() {
+        const char * e = getenv("GGML_VK_TQ_WG");
+        return e ? (std::string(e) == "large" ? 1 : (std::string(e) == "small" ? 0 : -1)) : -1;
+    }();
     switch (type) {
         case GGML_TYPE_TQ1_0: case GGML_TYPE_TQ1_0_X2: case GGML_TYPE_TQ1_0_X3: case GGML_TYPE_TQ1_0_X4:
+            return forced == 1;
         case GGML_TYPE_TQ1_0R_1024: case GGML_TYPE_TQ1_0R_1024_X2: case GGML_TYPE_TQ1_0R_1024_X3: case GGML_TYPE_TQ1_0R_1024_X4:
-            return large != 0;
+            GGML_UNUSED(k);
+            GGML_UNUSED(is_id);
+            return forced == 1;
         default:
             return false;
     }
@@ -5782,7 +5789,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         }
     }
 
-    if (ggml_vk_tq_large_wg(a_type)) {
+    if (ggml_vk_tq_large_wg(a_type, k, false)) {
         dmmv_wg = DMMV_WG_SIZE_LARGE;
     }
 
@@ -5881,7 +5888,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         }
     }
 
-    if (ggml_vk_tq_large_wg(a_type)) {
+    if (ggml_vk_tq_large_wg(a_type, k, true)) {
         dmmv_wg = DMMV_WG_SIZE_LARGE;
     }
 
