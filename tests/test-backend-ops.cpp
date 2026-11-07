@@ -11317,6 +11317,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, true, 512, 5, 2048));
         // int8 matmul: partial tiles in m and n, odd k block count, batch broadcast
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, 67, 3072, {2, 1}, {1, 1}));
+        // large M: the packed planes use the BK = 64 float tiles
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, 67, 2048, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 200, 67, 3072));
         // ids set to -1 (skipped slots, zeroed rows); n >= 9 goes through the batched matmul
         for (int n : {1, 3, 9, 64}) {
@@ -12762,6 +12764,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type type_a : {GGML_TYPE_TQ1_0_X3, GGML_TYPE_TQ1_0R_1024_X3, GGML_TYPE_TQ1_0R_1024_X4}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, 512, 1024, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 512, 2048, {1, 1}, {1, 1}));
+    }
+    // dense packed-plane shapes of the 35B-A3B ternary models (attention, shared experts, ssm_out)
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0R_1024_X3, GGML_TYPE_TQ1_0R_1024_X4}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, 512, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 512, 2048, {1, 1}, {1, 1}));
     }
     for (ggml_type type_a : {GGML_TYPE_TQ1_0, GGML_TYPE_Q4_K}) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, 512, 512));

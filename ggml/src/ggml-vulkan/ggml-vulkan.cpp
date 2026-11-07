@@ -2479,6 +2479,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         FOR_EACH_LUT_TYPE_NONFP4(X_CM1)
         FOR_EACH_TQ1R_TYPE(X_CM1)
+        {
+            // packed TQ1_0R_1024 planes, large M: BK = 64 (longer A row segments per K step; measured on gfx1151,
+            // x3/x4 m = 8192: -12/-18 %, slower for small M), selected by ggml_vk_mul_mat_q_f16
+            std::vector<vk_tile_config> tc_save = tc_mmq;
+            for (auto & t : tc_mmq) { t.warptile[3] = 64; }
+#define X_CM1_BK64(TYPE, tstr) \
+            if (device->coopmat_acc_f16_support) { \
+                cm1_create({TYPE, GGML_TYPE_F32, false, true,  false, true}, tc_mmq, "matmul_" #tstr "_f32_f16acc_bk64", matmul_##tstr##_f32_f16acc_cm1_len, matmul_##tstr##_f32_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3); \
+            } \
+            if (device->coopmat_acc_f32_support) { \
+                cm1_create({TYPE, GGML_TYPE_F32, false, false, false, true}, tc_mmq, "matmul_" #tstr "_f32_bk64",        matmul_##tstr##_f32_cm1_len,        matmul_##tstr##_f32_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
+            }
+            X_CM1_BK64(GGML_TYPE_TQ1_0R_1024_X2, tq1_0r_1024_x2)
+            X_CM1_BK64(GGML_TYPE_TQ1_0R_1024_X3, tq1_0r_1024_x3)
+            X_CM1_BK64(GGML_TYPE_TQ1_0R_1024_X4, tq1_0r_1024_x4)
+#undef X_CM1_BK64
+            tc_mmq = tc_save;
+        }
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM1_OCP(TYPE, tstr) \
@@ -6269,9 +6287,10 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
 }
 
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
-        ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false, bool res = false) {
+        ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false, bool res = false,
+        bool bk64 = false) {
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
-    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc, res};
+    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc, res, bk64};
     auto it = ctx->device->pipeline_matmul.find(key);
     if (it == ctx->device->pipeline_matmul.end() || it->second.empty()) {
         // Try without f16acc
@@ -6711,6 +6730,16 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool tq1r_q8mm = ggml_vk_tq1r_rotates_y(src0->type) && quantize_y && mmp_map != nullptr && !x_non_contig;
     if (ggml_vk_tq1r_rotates_y(src0->type) && !tq1r_rot && !tq1r_q8mm) {
         mmp_map = nullptr;
+    }
+    // packed planes with a large M: the BK = 64 tiles (GGML_VK_TQ1R_BK64_M = minimum M, 0 disables)
+    if (tq1r_rot && ggml_vk_tq_planes(src0->type) > 1) {
+        static const uint64_t bk64_m = []() { const char * e = getenv("GGML_VK_TQ1R_BK64_M"); return e ? (uint64_t)atoll(e) : (uint64_t)8192; }();
+        if (bk64_m != 0 && ne01 >= bk64_m) {
+            const auto * m64 = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst), false, false, true);
+            if (m64 != nullptr) {
+                mmp_map = m64;
+            }
+        }
     }
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;

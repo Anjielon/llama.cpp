@@ -260,10 +260,11 @@ struct vk_matmul_pipeline_key {
     bool mul_mat_id;
     bool f16acc;
     bool res = false;   // MUL_MAT_ID with the residual expert plane fused in (mul_mmq_cm1.comp, MUL_MAT_ID_RES)
+    bool bk64 = false;  // float mul_mm of the packed TQ1_0R_1024 planes with BK = 64 (large M)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, res)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.res);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, res, bk64)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.res, o.bk64);
     }
 };
 
