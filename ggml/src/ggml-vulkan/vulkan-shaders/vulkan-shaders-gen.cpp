@@ -930,6 +930,8 @@ void process_shaders() {
     }
     // activation rotation of the TQ1_0R_1024 types
     string_to_spv("rot_y_tq1_0r_1024_f32", "rot_y_tq1_0r_1024.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    // f16 output: half the B traffic of the float mul_mm of the TQ1_0R_1024 types (the _f16 matmul variants)
+    string_to_spv("rot_y_tq1_0r_1024_f16", "rot_y_tq1_0r_1024.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     string_to_spv("rot_q8_tq1_0r_1024", "rot_q8_tq1_0r_1024.comp", {});
     string_to_spv("rot_q8_1_tq1_0r_1024", "rot_q8_1_tq1_0r_1024.comp", {});

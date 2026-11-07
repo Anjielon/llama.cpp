@@ -2487,9 +2487,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #define X_CM1_BK64(TYPE, tstr) \
             if (device->coopmat_acc_f16_support) { \
                 cm1_create({TYPE, GGML_TYPE_F32, false, true,  false, true}, tc_mmq, "matmul_" #tstr "_f32_f16acc_bk64", matmul_##tstr##_f32_f16acc_cm1_len, matmul_##tstr##_f32_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3); \
+                cm1_create({TYPE, GGML_TYPE_F16, false, true,  false, true}, tc_mmq, "matmul_" #tstr "_f16_f16acc_bk64", matmul_##tstr##_f16_f16acc_cm1_len, matmul_##tstr##_f16_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3); \
             } \
             if (device->coopmat_acc_f32_support) { \
                 cm1_create({TYPE, GGML_TYPE_F32, false, false, false, true}, tc_mmq, "matmul_" #tstr "_f32_bk64",        matmul_##tstr##_f32_cm1_len,        matmul_##tstr##_f32_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
+                cm1_create({TYPE, GGML_TYPE_F16, false, false, false, true}, tc_mmq, "matmul_" #tstr "_f16_bk64",        matmul_##tstr##_f16_cm1_len,        matmul_##tstr##_f16_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
             }
             X_CM1_BK64(GGML_TYPE_TQ1_0R_1024_X2, tq1_0r_1024_x2)
             X_CM1_BK64(GGML_TYPE_TQ1_0R_1024_X3, tq1_0r_1024_x3)
@@ -3251,6 +3253,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ1_0_X3], "dequant_tq1_0_x3", dequant_tq1_0_x3_len, dequant_tq1_0_x3_data, "main", 2, 5 * sizeof(uint32_t), {256 * 4 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ1_0_X4], "dequant_tq1_0_x4", dequant_tq1_0_x4_len, dequant_tq1_0_x4_data, "main", 2, 5 * sizeof(uint32_t), {256 * 4 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rot_y_tq1_0r_1024_f32, "rot_y_tq1_0r_1024_f32", rot_y_tq1_0r_1024_f32_len, rot_y_tq1_0r_1024_f32_data, "main", 2, sizeof(uint32_t), {1024, 1, 1}, {}, 1);
+    if (device->fp16) {
+        ggml_vk_create_pipeline(device, device->pipeline_rot_y_tq1_0r_1024_f16, "rot_y_tq1_0r_1024_f16", rot_y_tq1_0r_1024_f16_len, rot_y_tq1_0r_1024_f16_data, "main", 2, sizeof(uint32_t), {1024, 1, 1}, {}, 1);
+    }
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     if (device->integer_dot_product) {
         ggml_vk_create_pipeline(device, device->pipeline_rot_q8_tq1r, "rot_q8_tq1_0r_1024", rot_q8_tq1_0r_1024_len, rot_q8_tq1_0r_1024_data, "main", 2, 5 * sizeof(uint32_t), {1024, 1, 1}, {}, 1);
@@ -6595,7 +6600,7 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
 // perf-heuristic for choosing mul_mat b type, based on shader availability
 static bool ggml_vk_tq1r_rotates_y(ggml_type type);
 static void ggml_vk_tq1r_rotate_y(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src1, vk_pipeline & to_f32,
-                                  const vk_subbuffer & d_Qy, const vk_subbuffer & d_Y, uint64_t y_ne, bool y_non_contig, bool q8);
+                                  const vk_subbuffer & d_Qy, const vk_subbuffer & d_Y, uint64_t y_ne, bool y_non_contig, bool q8, bool f16 = false);
 static void ggml_vk_tq1r_quantize_y(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint64_t ne);
 // TQ1_0R_1024 batched mul_mat in the rotated domain (weights decoded in mul_mm, B rotated first); GGML_VK_TQ1R_MM=0 keeps
 // the dequantize-to-f16 path
@@ -6638,9 +6643,14 @@ static ggml_type ggml_vk_mul_mat_b_type(
         can_quantize_y = false;
     }
     if (ggml_vk_tq1r_rotates_y(src0_type) && ggml_vk_tq1r_mm_enabled()) {
-        // B is rotated before the matmul: rotated and quantized to q8_1 for the int8 path, rotated in f32 otherwise
+        // B is rotated before the matmul: rotated and quantized to q8_1 for the int8 path, rotated in f16 (half the
+        // B traffic; GGML_VK_TQ1R_B16=0 keeps f32) or f32 otherwise
         if (can_quantize_y && src1->ne[0] % 1024 == 0 && ctx->device->pipeline_rot_q8_1_tq1r != nullptr && available(GGML_TYPE_Q8_1)) {
             return GGML_TYPE_Q8_1;
+        }
+        static const bool b16 = []() { const char * e = getenv("GGML_VK_TQ1R_B16"); return e == nullptr || atoi(e) != 0; }();
+        if (b16 && src1->type == GGML_TYPE_F32 && ctx->device->pipeline_rot_y_tq1_0r_1024_f16 != nullptr && available(GGML_TYPE_F16)) {
+            return GGML_TYPE_F16;
         }
         return (src1->type == GGML_TYPE_F32 && available(GGML_TYPE_F32)) ? GGML_TYPE_F32 : f16_type;
     }
@@ -6719,7 +6729,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // TQ1_0R_1024: the matmul decodes the weights in the rotated domain, so B is rotated into prealloc_y first;
     // any other case dequantizes the weights (which undoes the rotation) as before
     const bool tq1r_rot = ggml_vk_tq1r_rotates_y(src0->type) && ggml_vk_tq1r_mm_enabled() && mmp_map != nullptr && !x_non_contig &&
-                          y_kernel_type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ne10 % 1024 == 0;
+                          (y_kernel_type == GGML_TYPE_F32 || y_kernel_type == GGML_TYPE_F16) &&
+                          src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ne10 % 1024 == 0;
     if (ggml_vk_tq1r_rotates_y(src0->type) && getenv("GGML_VK_TQ1R_DEBUG")) {
         static int n_dbg = 0;
         if (n_dbg++ < 4) {
@@ -6823,7 +6834,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
         }
         if (qy_needs_dequant) {
-            ggml_pipeline_request_descriptor_sets(ctx, tq1r_rot ? ctx->device->pipeline_rot_y_tq1_0r_1024_f32 : to_fp16_vk_1, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, tq1r_rot ? (y_kernel_type == GGML_TYPE_F16 ? ctx->device->pipeline_rot_y_tq1_0r_1024_f16 : ctx->device->pipeline_rot_y_tq1_0r_1024_f32) : to_fp16_vk_1, 1);
         }
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
@@ -6889,7 +6900,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             ggml_vk_sync_buffers(ctx, subctx);
         }
         ggml_vk_tq1r_rotate_y(ctx, subctx, src1, to_fp16_vk_1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0),
-                              ne10 * ne11 * ne12 * ne13, false, false);
+                              ne10 * ne11 * ne12 * ne13, false, false, y_kernel_type == GGML_TYPE_F16);
     } else
     if (y_needs_reformat) {
         if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
@@ -6940,7 +6951,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     // column stride in bytes of the B buffer: raw src1 keeps its own stride, staging buffers are tightly packed
     const uint64_t b_col_bytes = (y_needs_reformat || qy_needs_dequant || quantize_y)
-        ? (quantize_y ? (uint64_t)(ne10 / ggml_blck_size(GGML_TYPE_Q8_1)) * ggml_type_size(GGML_TYPE_Q8_1) : (uint64_t)ne10 * sizeof(ggml_fp16_t))
+        ? (quantize_y ? (uint64_t)(ne10 / ggml_blck_size(GGML_TYPE_Q8_1)) * ggml_type_size(GGML_TYPE_Q8_1) : (uint64_t)ne10 * (y_f32_kernel ? sizeof(float) : sizeof(ggml_fp16_t)))
         : (uint64_t)src1->nb[1];
 
     // compute
@@ -7140,8 +7151,9 @@ static bool ggml_vk_tq1r_q8_enabled(const ggml_backend_vk_context * ctx) {
 // Writes the rotated f32 activation into d_Y (prealloc_y). The rotated copy is kept for the next consumers
 // of the same src1 (e.g. the other projections reading the same activation).
 static void ggml_vk_tq1r_rotate_y(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src1, vk_pipeline & to_f32,
-                                  const vk_subbuffer & d_Qy, const vk_subbuffer & d_Y, uint64_t y_ne, bool y_non_contig, bool q8 = false) {
-    vk_pipeline & rot = q8 ? ctx->device->pipeline_rot_q8_tq1r : ctx->device->pipeline_rot_y_tq1_0r_1024_f32;
+                                  const vk_subbuffer & d_Qy, const vk_subbuffer & d_Y, uint64_t y_ne, bool y_non_contig, bool q8, bool f16) {
+    GGML_ASSERT(!(f16 && (q8 || y_non_contig)));
+    vk_pipeline & rot = q8 ? ctx->device->pipeline_rot_q8_tq1r : (f16 ? ctx->device->pipeline_rot_y_tq1_0r_1024_f16 : ctx->device->pipeline_rot_y_tq1_0r_1024_f32);
     if (ctx->prealloc_y_last_pipeline_used == rot.get() && ctx->prealloc_y_last_tensor_used == src1 && !ctx->prealloc_y_last_k_padded) {
         return;
     }
@@ -7149,7 +7161,7 @@ static void ggml_vk_tq1r_rotate_y(ggml_backend_vk_context * ctx, vk_context& sub
     if (ctx->prealloc_y_need_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
-    const vk_subbuffer y = { d_Y.buffer, d_Y.offset, sizeof(float) * y_ne };
+    const vk_subbuffer y = { d_Y.buffer, d_Y.offset, (f16 ? sizeof(ggml_fp16_t) : sizeof(float)) * y_ne };
     if (y_non_contig) {
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_f32, src1, d_Qy, y);
     }
@@ -7957,8 +7969,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     // TQ1_0R_1024: experts decoded in the rotated domain, B rotated into prealloc_y first (see ggml_vk_mul_mat_q_f16)
     const bool tq1r_rot = ggml_vk_tq1r_rotates_y(src0->type) && ggml_vk_tq1r_mm_enabled() && mmp_map != nullptr && !x_non_contig &&
-                          !ctx->device->coopmat2 && y_kernel_type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-                          ggml_is_contiguous(src1) && ne10 % 1024 == 0;
+                          !ctx->device->coopmat2 && (y_kernel_type == GGML_TYPE_F32 || y_kernel_type == GGML_TYPE_F16) &&
+                          src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ne10 % 1024 == 0;
     if (ggml_vk_tq1r_rotates_y(src0->type) && getenv("GGML_VK_TQ1R_DEBUG")) {
         static int n_dbg = 0;
         if (n_dbg++ < 4) {
@@ -8078,7 +8090,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
         }
         if (qy_needs_dequant) {
-            ggml_pipeline_request_descriptor_sets(ctx, tq1r_rot ? ctx->device->pipeline_rot_y_tq1_0r_1024_f32 : to_fp16_vk_1, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, tq1r_rot ? (y_kernel_type == GGML_TYPE_F16 ? ctx->device->pipeline_rot_y_tq1_0r_1024_f16 : ctx->device->pipeline_rot_y_tq1_0r_1024_f32) : to_fp16_vk_1, 1);
         }
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
@@ -8165,7 +8177,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_vk_sync_buffers(ctx, subctx);
         }
         ggml_vk_tq1r_rotate_y(ctx, subctx, src1, to_fp16_vk_1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0),
-                              ne10 * ne11 * ne12 * ne13, false, false);
+                              ne10 * ne11 * ne12 * ne13, false, false, y_kernel_type == GGML_TYPE_F16);
     } else
     if (y_needs_reformat) {
         if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
