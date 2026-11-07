@@ -539,6 +539,27 @@ struct block_a_prefetch {
     vec2 d[PACKED_K];           // scale of sub-blocks 0..3 and 4..7
 };
 
+// A accessors of the group loader: with MUL_MAT_ID_RES the second K pass (g_pass = 1) reads the residual plane W2
+#if defined(DATA_A_TQ1_0)
+#ifdef MUL_MAT_ID_RES
+#define TQ_ACC16(field) if (g_pass != 0u) { return data_a2_tq16[bi].field; } return data_a_tq16[bi].field;
+#else
+#define TQ_ACC16(field) return data_a_tq16[bi].field;
+#endif
+uint16_t tq16_qs(uint bi, uint i) { TQ_ACC16(qs[i]) }
+uint16_t tq16_qh(uint bi, uint i) { TQ_ACC16(qh[i]) }
+float16_t tq16_d(uint bi) { TQ_ACC16(d) }
+#else
+#ifdef MUL_MAT_ID_RES
+#define TQ_ACC32(field) if (g_pass != 0u) { return data_a2_tq32[bi].field; } return data_a_tq32[bi].field;
+#else
+#define TQ_ACC32(field) return data_a_tq32[bi].field;
+#endif
+uint tq32_qs(uint bi, uint i) { TQ_ACC32(qs[i]) }
+uint tq32_qh(uint bi, uint i) { TQ_ACC32(qh[i]) }
+uint tq32_d(uint bi, uint i) { TQ_ACC32(d[i]) }
+#endif
+
 block_a_prefetch block_a_load_group(uint ib, uint loadr) {
     block_a_prefetch blk;
 #if defined(DATA_A_TQ1_0)
@@ -551,19 +572,19 @@ block_a_prefetch block_a_load_group(uint ib, uint loadr) {
     [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
         const uint bi = ib_k * PACKED_K + pk;
 #if defined(DATA_A_TQ1_0)
-        blk.w[5u * pk     ] = pack32(u16vec2(data_a_tq16[bi].qs[4u * loadr     ], data_a_tq16[bi].qs[4u * loadr + 1u]));
-        blk.w[5u * pk + 1u] = pack32(u16vec2(data_a_tq16[bi].qs[4u * loadr + 2u], data_a_tq16[bi].qs[4u * loadr + 3u]));
-        blk.w[5u * pk + 2u] = pack32(u16vec2(data_a_tq16[bi].qs[16u + 4u * r2     ], data_a_tq16[bi].qs[16u + 4u * r2 + 1u]));
-        blk.w[5u * pk + 3u] = pack32(u16vec2(data_a_tq16[bi].qs[16u + 4u * r2 + 2u], data_a_tq16[bi].qs[16u + 4u * r2 + 3u]));
-        blk.w[5u * pk + 4u] = pack32(u16vec2(data_a_tq16[bi].qh[0], data_a_tq16[bi].qh[1]));
-        blk.d[pk] = vec2((loadr == 0u) ? float(data_a_tq16[bi].d) : 0.0);
+        blk.w[5u * pk     ] = pack32(u16vec2(tq16_qs(bi, 4u * loadr     ), tq16_qs(bi, 4u * loadr + 1u)));
+        blk.w[5u * pk + 1u] = pack32(u16vec2(tq16_qs(bi, 4u * loadr + 2u), tq16_qs(bi, 4u * loadr + 3u)));
+        blk.w[5u * pk + 2u] = pack32(u16vec2(tq16_qs(bi, 16u + 4u * r2     ), tq16_qs(bi, 16u + 4u * r2 + 1u)));
+        blk.w[5u * pk + 3u] = pack32(u16vec2(tq16_qs(bi, 16u + 4u * r2 + 2u), tq16_qs(bi, 16u + 4u * r2 + 3u)));
+        blk.w[5u * pk + 4u] = pack32(u16vec2(tq16_qh(bi, 0), tq16_qh(bi, 1)));
+        blk.d[pk] = vec2((loadr == 0u) ? float(tq16_d(bi)) : 0.0);
 #else
-        blk.w[5u * pk     ] = data_a_tq32[bi].qs[q * 12u + 2u * loadr];
-        blk.w[5u * pk + 1u] = data_a_tq32[bi].qs[q * 12u + 2u * loadr + 1u];
-        blk.w[5u * pk + 2u] = data_a_tq32[bi].qs[q * 12u + 8u + 2u * r2];
-        blk.w[5u * pk + 3u] = data_a_tq32[bi].qs[q * 12u + 8u + 2u * r2 + 1u];
-        blk.w[5u * pk + 4u] = data_a_tq32[bi].qh[q];
-        blk.d[pk] = (loadr == 0u) ? unpackHalf2x16(data_a_tq32[bi].d[q]) : vec2(0.0);
+        blk.w[5u * pk     ] = tq32_qs(bi, q * 12u + 2u * loadr);
+        blk.w[5u * pk + 1u] = tq32_qs(bi, q * 12u + 2u * loadr + 1u);
+        blk.w[5u * pk + 2u] = tq32_qs(bi, q * 12u + 8u + 2u * r2);
+        blk.w[5u * pk + 3u] = tq32_qs(bi, q * 12u + 8u + 2u * r2 + 1u);
+        blk.w[5u * pk + 4u] = tq32_qh(bi, q);
+        blk.d[pk] = (loadr == 0u) ? unpackHalf2x16(tq32_d(bi, q)) : vec2(0.0);
 #endif
     }
     return blk;

@@ -2310,19 +2310,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // slot ids of the residual planes: the map holds -1 for the experts without one, and MUL_MAT_ID gives
     // zero rows for negative ids, so no mask is needed; tensors that share a map share the ids too
     ggml_tensor * exps2_map_done = nullptr, * exps2_ids = nullptr;
-    auto build_exps2 = [&](ggml_tensor * y, ggml_tensor * w2, ggml_tensor * map, ggml_tensor * x) -> ggml_tensor * {
-        if (map == nullptr) {
-            GGML_ASSERT(w2->ne[2] == n_expert);
-            return ggml_add(ctx0, y, build_lora_mm_id(w2, x, selected_experts, nullptr));
-        }
-        if (map != exps2_map_done) {
+    // the slot ids are built before the main expert matmul they follow (exps2_prepare), so that the main matmul,
+    // the residual one and their ADD are consecutive graph nodes that a backend can fuse
+    auto exps2_prepare = [&](ggml_tensor * map) {
+        if (map != nullptr && map != exps2_map_done) {
             const int64_t n_used = selected_experts->ne[0];
             const int64_t n_tok  = selected_experts->ne[1];
             ggml_tensor * map_t = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, map, 1, n_expert, 1), 1, n_expert, n_tok, 1);
             ggml_tensor * s     = ggml_get_rows(ctx0, map_t, selected_experts);                  // [1, n_used, n_tok]
             exps2_ids      = ggml_cast(ctx0, ggml_reshape_2d(ctx0, s, n_used, n_tok), GGML_TYPE_I32);
             exps2_map_done = map;
+            // expanded now: otherwise the graph visits the id nodes between the two matmuls
+            ggml_build_forward_expand(gf, exps2_ids);
         }
+    };
+    auto build_exps2 = [&](ggml_tensor * y, ggml_tensor * w2, ggml_tensor * map, ggml_tensor * x) -> ggml_tensor * {
+        if (map == nullptr) {
+            GGML_ASSERT(w2->ne[2] == n_expert);
+            return ggml_add(ctx0, y, build_lora_mm_id(w2, x, selected_experts, nullptr));
+        }
+        exps2_prepare(map);
         return ggml_add(ctx0, y, build_lora_mm_id(w2, x, exps2_ids, nullptr));
     };
     GGML_ASSERT(!(gate_up_exps && exps2 && (exps2->up || exps2->gate)) && "residual expert planes need separate gate and up experts");
@@ -2360,6 +2367,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
+        if (exps2 && exps2->up) {
+            exps2_prepare(exps2->up_map);
+        }
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
@@ -2379,6 +2389,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         if (gate_exps) {
             ggml_tensor * gate_in = cur;
+            if (exps2 && exps2->gate) {
+                exps2_prepare(exps2->gate_map);
+            }
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
 
@@ -2497,6 +2510,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
+        if (exps2 && exps2->down) {
+            exps2_prepare(exps2->down_map);
+        }
         experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);

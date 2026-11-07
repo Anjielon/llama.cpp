@@ -646,6 +646,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
                      || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4" || tname == "tq1_0")) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
+            // expert matmul with the residual expert plane fused in (second K pass over W2[map[expert]])
+            if (tname == "tq1_0" && matmul_id_type == MatMulIdType::SUBGROUP) {
+                string_to_spv(shader_name + "_" + tname + "_q8_1_res", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}, {"MUL_MAT_ID_RES", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            }
         }
 
         if (is_lut_quant(tname)) {
@@ -721,6 +725,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         // int8 coopmat path: B rotated and quantized to q8_1 by rot_q8_1_tq1_0r_1024.comp
         if (!f16acc && coopmat) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
+            if (tname == "tq1_0r_1024" && matmul_id_type == MatMulIdType::SUBGROUP) {
+                string_to_spv(shader_name + "_" + tname + "_q8_1_res", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}, {"MUL_MAT_ID_RES", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            }
         }
     }
 }

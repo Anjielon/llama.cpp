@@ -19,6 +19,11 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer AW {uint data_aw[];};
 
+#ifdef MUL_MAT_ID
+// residual expert plane (MAT_VEC_FUSION_FLAGS_RES): W2 in the Fuse0 binding, same row layout as A
+layout (binding = 3) readonly buffer AW_RES {uint data_res_aw[];};
+#endif
+
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
 const uint TQ1R_WORDS = 56u; // 224 bytes per block
@@ -55,6 +60,9 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 #ifdef MUL_MAT_ID
     // a skipped slot (id -1) reads nothing: the row is zeroed by reduce_result
     const uint nws = expert_skip ? 0u : nb * 52u;
+    // residual expert plane: slot of W2 for this expert, uniform per workgroup
+    const int res_slot = ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_RES) != 0u && !expert_skip) ? int(data_fuse1[expert_id]) : -1;
+    const uint res_a_offset = res_slot >= 0 ? uint(res_slot) * (p.batch_stride_a / QUANT_K) : 0u;
 #else
     const uint nws = nb * 52u;
 #endif
@@ -95,6 +103,15 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
                     acc += plane_acc(data_aw[wb + pk * TQ1R_WORDS + wword], data_aw[wb + pk * TQ1R_WORDS + 52u + q],
                                      c1, y0, y1, y2, y3, y4, s0, s1, s2, s3, s4);
                 }
+#ifdef MUL_MAT_ID
+                if (res_slot >= 0) {
+                    const uint wr = ((res_a_offset + (first_row + n) * nb + blk) * PACKED_K) * TQ1R_WORDS;
+                    [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+                        acc += plane_acc(data_res_aw[wr + pk * TQ1R_WORDS + wword], data_res_aw[wr + pk * TQ1R_WORDS + 52u + q],
+                                         c1, y0, y1, y2, y3, y4, s0, s1, s2, s3, s4);
+                    }
+                }
+#endif
                 temp[jcol][n] += FLOAT_TYPE(acc);
             }
         }

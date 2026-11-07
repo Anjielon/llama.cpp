@@ -20,6 +20,10 @@
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A16 {uint16_t data_a16[];};
+#ifdef MUL_MAT_ID
+// residual expert plane (MAT_VEC_FUSION_FLAGS_RES): W2 in the Fuse0 binding, same row layout as A
+layout (binding = 3) readonly buffer A16_RES {uint16_t data_res_a16[];};
+#endif
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
@@ -42,6 +46,9 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 #ifdef MUL_MAT_ID
     // a skipped slot (id -1) reads nothing: the row is zeroed by reduce_result
     const uint nitems = expert_skip ? 0u : num_rows * nwr;
+    // residual expert plane: slot of W2 for this expert, uniform per workgroup
+    const int res_slot = ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_RES) != 0u && !expert_skip) ? int(data_fuse1[expert_id]) : -1;
+    const uint res_a_offset = res_slot >= 0 ? uint(res_slot) * (p.batch_stride_a / QUANT_K) : 0u;
 #else
     const uint nitems = num_rows * nwr;
 #endif
@@ -65,6 +72,19 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
             dp[pk] = float(uint16BitsToHalf(data_a16[h + 26u]));
             tq1_swar_digits(w, x0[pk], x1[pk], x2[pk], x3[pk], x4[pk]);
         }
+#ifdef MUL_MAT_ID
+        vec4 r0[PACKED_K], r1[PACKED_K], r2[PACKED_K], r3[PACKED_K], r4[PACKED_K];
+        float dr[PACKED_K];
+        if (res_slot >= 0) {
+            const uint ir0 = (res_a_offset + (first_row + n) * nb + blk) * PACKED_K;
+            [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+                const uint h = (ir0 + pk) * TQ1_HALVES;
+                const uint w = uint(data_res_a16[h + 2u * r]) | (uint(data_res_a16[h + 2u * r + 1u]) << 16);
+                dr[pk] = float(uint16BitsToHalf(data_res_a16[h + 26u]));
+                tq1_swar_digits(w, r0[pk], r1[pk], r2[pk], r3[pk], r4[pk]);
+            }
+        }
+#endif
 
         [[unroll]] for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
             const uint yb = (jcol * p.batch_stride_b + b_offset + blk * QUANT_K + e0) >> 2;
@@ -83,6 +103,14 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
                 const float dt = (dot(x0[pk], y0) + dot(x1[pk], y1)) + (dot(x2[pk], y2) + dot(x3[pk], y3)) + dot(x4[pk], y4);
                 acc += dp[pk] * (dt - s);
             }
+#ifdef MUL_MAT_ID
+            if (res_slot >= 0) {
+                [[unroll]] for (uint pk = 0u; pk < PACKED_K; ++pk) {
+                    const float dt = (dot(r0[pk], y0) + dot(r1[pk], y1)) + (dot(r2[pk], y2) + dot(r3[pk], y3)) + dot(r4[pk], y4);
+                    acc += dr[pk] * (dt - s);
+                }
+            }
+#endif
             [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
                 temp[jcol][i] += (i == n) ? FLOAT_TYPE(acc) : FLOAT_TYPE(0);
             }
