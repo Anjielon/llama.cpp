@@ -2944,7 +2944,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // TQ1_0R_1024 types: the activation loads of a block are shared by all the rows of a workgroup
     const uint32_t rm_tq1r = 4 * rm_kq;
     // TQ1_0 types (word-wise mat-vec): rows per workgroup, GGML_VK_TQ1_ROWS overrides for tuning
-    const uint32_t rm_tq1 = []() { const char * e = getenv("GGML_VK_TQ1_ROWS"); return e ? (uint32_t) atoi(e) : 0u; }() ?: rm_kq;
+    const uint32_t rm_tq1_env = []() { const char * e = getenv("GGML_VK_TQ1_ROWS"); return e ? (uint32_t) atoi(e) : 0u; }();
+    const uint32_t rm_tq1 = rm_tq1_env != 0 ? rm_tq1_env : rm_kq;
     // TQ1_0R_1024 types: the same mat-vec shader is also built with 1, 2, 4... rows per workgroup (spec constant 1)
     // for the matrices too small to fill the GPU with the default; ggml_vk_tq1r_rows_pipeline picks one per shape
     auto const ggml_vk_create_pipeline_tq1r = [&](vk_device& device, vk_pipeline& base, const char *name, size_t spv_size, const void* spv_data, const char *entrypoint,
