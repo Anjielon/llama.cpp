@@ -116,7 +116,10 @@ struct moe_cache_slru {
         }
         uniq.clear();
         for (size_t i = 0; i < n_ids; ++i) {
-            GGML_ASSERT(ids[i] >= 0 && ids[i] < n_expert);
+            if (ids[i] < 0) {
+                continue; // empty slot (sparse expert planes)
+            }
+            GGML_ASSERT(ids[i] < n_expert);
             if (seen[ids[i]] != seen_gen) {
                 seen[ids[i]] = seen_gen;
                 uniq.push_back(ids[i]);
