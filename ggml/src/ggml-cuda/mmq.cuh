@@ -244,7 +244,10 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     if (ggml_cuda_tq_planes(type) > 0) {
         ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(GGML_TYPE_Q8_0, J, fallback, cc, prec_src1);
         if (config.type != GGML_TYPE_COUNT) {
-            config.type = type;
+            config.type     = type;
+            // tiling: MUL_MAT_ID loops over the column tiles of an expert (see mul_mat_q), whose row count is only
+            // known on the device (repeated experts); stream-k would need the worst case in the grid
+            config.stream_k = false;
         }
         return config;
     }
@@ -289,7 +292,10 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     if (ggml_cuda_tq_planes(type) > 0) {
         ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(GGML_TYPE_Q8_0, J, fallback, prec_src1);
         if (config.type != GGML_TYPE_COUNT) {
-            config.type = type;
+            config.type     = type;
+            // tiling: MUL_MAT_ID loops over the column tiles of an expert (see mul_mat_q), whose row count is only
+            // known on the device (repeated experts); stream-k would need the worst case in the grid
+            config.stream_k = false;
         }
         return config;
     }

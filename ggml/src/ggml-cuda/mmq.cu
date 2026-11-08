@@ -456,10 +456,9 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        // ternary types: an expert repeated within a token has more rows than tokens; the tiling kernel loops over
-        // the extra column tiles, the stream-k kernel needs them in the grid
-        is_tq && ggml_cuda_mmq_get_stream_k(src0->type, J_best, fallback, cc, prec_src1) ? ne_get_rows : ne12,
-        J_best, fusion_device};
+        // ternary types: an expert repeated within a token has more rows than tokens, the (tiling) kernel loops
+        // over the extra column tiles
+        ne12, J_best, fusion_device};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
