@@ -669,6 +669,11 @@ static __global__ void mul_mat_vec_q(
 
     ggml_cuda_pdl_sync();
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
+    // a negative id is a skipped slot: read expert 0 and write zeros (as the CPU backend, which leaves it at zero)
+    const bool skip_slot = !shared_expert && ncols_dst == 1 && ids && (int32_t) channel_x < 0;
+    if (skip_slot) {
+        channel_x = 0;
+    }
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
@@ -868,7 +873,7 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
+                dst[j*stride_col_dst + i] = skip_slot ? 0.0f : result;
             }
         }
     }
@@ -948,7 +953,10 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    const int32_t  id_raw    = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    // a negative id is a skipped slot: read expert 0 and write zeros (as the CPU backend, which leaves it at zero)
+    const bool     skip_slot = id_raw < 0;
+    const uint32_t channel_x = skip_slot ? 0 : (uint32_t) id_raw;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
@@ -1029,7 +1037,7 @@ static __global__ void mul_mat_vec_q_moe(
                 }
             }
         }
-        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
+        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = skip_slot ? 0.0f : result;
     }
 
     if constexpr (!has_fusion) {

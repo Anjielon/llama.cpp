@@ -97,6 +97,12 @@ static void tq1r_rot_launch(const src_t * x, dst_t * y, int64_t ne10, int64_t ne
     k_rot_tq1r<ROTATE, src_t, dst_t><<<grid, 256, 0, stream>>>(x, y, ne10, ne11, ne12, nrows, s11, s12, s13);
 }
 
+void ggml_cuda_tq1r_rotate_f32(const float * x, float * y, int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+                               int64_t s11, int64_t s12, int64_t s13, cudaStream_t stream) {
+    GGML_ASSERT(ne10 % 1024 == 0);
+    tq1r_rot_launch<true, float, float>(x, y, ne10, ne11, ne12, ne13, s11, s12, s13, stream);
+}
+
 // Plain strided conversion for any ne10 (TQ1_0 family: rows are multiples of 256, not of 1024).
 template <typename src_t, typename dst_t>
 static __global__ void k_cvt_tq(const src_t * __restrict__ x, dst_t * __restrict__ y,
@@ -263,9 +269,15 @@ static __global__ void __launch_bounds__(128) k_mmv_tq1r_q8(const tq1r_mmv_param
         const int64_t e = blockIdx.y;
         const int64_t t = blockIdx.z;
         const int32_t expert = p.ids[t*p.ids_s1 + e*p.ids_s0];
+        drow  = (float *) ((char *) p.dst + t*p.nb2 + e*p.nb1) + row;
+        if (expert < 0) { // skipped slot: zero, as on the CPU backend
+            if (lane == 0) {
+                *drow = 0.0f;
+            }
+            return;
+        }
         wrow  = p.w + expert*p.nb02 + row*p.nb01;
         ycol0 = t*p.ne11 + (e % p.ne11);
-        drow  = (float *) ((char *) p.dst + t*p.nb2 + e*p.nb1) + row;
     } else {
         const int64_t i2 = blockIdx.y;
         const int64_t i3 = blockIdx.z;

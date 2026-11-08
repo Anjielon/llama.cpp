@@ -1195,6 +1195,22 @@ static bool op_filter_entry_matches(std::string_view entry, std::string_view op_
 }
 
 // TODO: [TAG_MUL_MAT_ID_SKIP] see https://github.com/ggml-org/llama.cpp/pull/26631
+static bool is_ternary_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ1_0_X2:
+        case GGML_TYPE_TQ1_0_X3:
+        case GGML_TYPE_TQ1_0_X4:
+        case GGML_TYPE_TQ1_0R_1024:
+        case GGML_TYPE_TQ1_0R_1024_X2:
+        case GGML_TYPE_TQ1_0R_1024_X3:
+        case GGML_TYPE_TQ1_0R_1024_X4:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) {
     const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
     if (strcmp(name, "CUDA") != 0 && strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0) {
@@ -1203,6 +1219,10 @@ static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) 
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
         const ggml_tensor * node = ggml_graph_node(gf, i);
         if (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_ADD_ID) {
+            continue;
+        }
+        // the ternary types handle skipped slots on CUDA (zeroed rows on every MUL_MAT_ID path)
+        if (node->op == GGML_OP_MUL_MAT_ID && is_ternary_type(node->src[0]->type)) {
             continue;
         }
         const ggml_tensor * ids = node->src[2];
@@ -11353,6 +11373,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 16, 8, false, 256, n, k));
         }
         test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 16, 8, true, 256, 17, k));
+    }
+
+    // ternary types, int8 MMQ path: batches above 64 (several column tiles), partial tiles in m and n, batch
+    // broadcast, skipped slots (id -1) and repeated experts within a token
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0, GGML_TYPE_TQ1_0_X2, GGML_TYPE_TQ1_0_X3, GGML_TYPE_TQ1_0_X4,
+                             GGML_TYPE_TQ1_0R_1024, GGML_TYPE_TQ1_0R_1024_X2, GGML_TYPE_TQ1_0R_1024_X3, GGML_TYPE_TQ1_0R_1024_X4}) {
+        const int64_t k = ggml_blck_size(type_a) == 256 ? 768 : 2048;
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 129, k, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 200, 300, k, {2, 1}, {1, 1}));
+        for (int n : {9, 65, 129}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 512, n, k, 0, false, true));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 200, 300, k));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, true, 256, 129, k, 0, false, true));
+        test_cases.emplace_back(new test_mul_mat_id_dup(type_a, GGML_TYPE_F32, 16, 8, false, 256, 129, k));
     }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above

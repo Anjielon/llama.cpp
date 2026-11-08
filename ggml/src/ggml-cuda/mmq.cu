@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "tq1r.cuh"
 
 #include <cstdint>
 
@@ -85,6 +86,31 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             }
             mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
+// -----------------------------------------------------------------------
+        case GGML_TYPE_TQ1_0:
+            mul_mat_q_case<GGML_TYPE_TQ1_0, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQ1_0_X2:
+            mul_mat_q_case<GGML_TYPE_TQ1_0_X2, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQ1_0_X3:
+            mul_mat_q_case<GGML_TYPE_TQ1_0_X3, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQ1_0_X4:
+            mul_mat_q_case<GGML_TYPE_TQ1_0_X4, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQ1_0R_1024:
+            mul_mat_q_case<GGML_TYPE_TQ1_0R_1024, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQ1_0R_1024_X2:
+            mul_mat_q_case<GGML_TYPE_TQ1_0R_1024_X2, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQ1_0R_1024_X3:
+            mul_mat_q_case<GGML_TYPE_TQ1_0R_1024_X3, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQ1_0R_1024_X4:
+            mul_mat_q_case<GGML_TYPE_TQ1_0R_1024_X4, GGML_PREC_Q8>(ctx, args, stream);
+            break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -161,6 +187,29 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
+// MUL_MAT_ID of the ternary types: the slots whose id is negative (skipped, e.g. sparse expert planes) get no
+// sorted row, so the MMQ kernel never writes them; they must read as zero, as on the CPU backend.
+static __global__ void mmq_zero_skipped_slots(const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int ne0, const int si1, const int64_t s1, const int64_t s2) {
+    const int iex = blockIdx.x;
+    const int it  = blockIdx.y;
+    if (ids[it*si1 + iex] >= 0) {
+        return;
+    }
+    float * row = dst + it*s2 + iex*s1;
+    for (int i = threadIdx.x; i < ne0; i += blockDim.x) {
+        row[i] = 0.0f;
+    }
+}
+
+static bool ggml_cuda_tq_mmq_enabled() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_CUDA_TQ_MMQ");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -200,6 +249,27 @@ void ggml_cuda_mul_mat_q(
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
+    // ternary types: TQ1_0R_1024 blocks are indexed by 256-element quarter, and their activation is rotated
+    // (contiguous copy, (1/32) H_1024 S per 1024-chunk) before the Q8_1 quantization
+    const bool    is_tq   = ggml_cuda_tq_planes(src0->type) > 0;
+    const bool    is_r    = ggml_cuda_tq_is_r1024(src0->type);
+    const int64_t x_scale = is_r ? 4 : 1;
+    // src1 element strides, those of the rotated copy for TQ1_0R_1024
+    int64_t src1_s11 = nb11 / ts_src1;
+    int64_t src1_s12 = nb12 / ts_src1;
+    int64_t src1_s13 = nb13 / ts_src1;
+    ggml_cuda_pool_alloc<float> src1_rot(ctx.pool());
+    if (is_r) {
+        GGML_ASSERT(!fusion);
+        src1_rot.alloc(ne10*ne11*ne12*ne13);
+        ggml_cuda_tq1r_rotate_f32(src1_d, src1_rot.get(), ne10, ne11, ne12, ne13, src1_s11, src1_s12, src1_s13, stream);
+        CUDA_CHECK(cudaGetLastError());
+        src1_d   = src1_rot.get();
+        src1_s11 = ne10;
+        src1_s12 = ne10*ne11;
+        src1_s13 = ne10*ne11*ne12;
+    }
+
     // If src0 (or the fused gate weight) is a temporary compute buffer, clear any potential padding.
     for (const ggml_tensor * t : { src0, gate }) {
         if (t && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -215,11 +285,11 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
-    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s01 = src0->nb[1] / ts_src0 * x_scale;
     const int64_t s1  =  dst->nb[1] / ts_dst;
-    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s02 = src0->nb[2] / ts_src0 * x_scale;
     const int64_t s2  =  dst->nb[2] / ts_dst;
-    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s03 = src0->nb[3] / ts_src0 * x_scale;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
     const bool fallback = ggml_cuda_mmq_needs_fallback(ne01);
@@ -266,9 +336,9 @@ void ggml_cuda_mul_mat_q(
         }
 
         {
-            const int64_t s11 = src1->nb[1] / ts_src1;
-            const int64_t s12 = src1->nb[2] / ts_src1;
-            const int64_t s13 = src1->nb[3] / ts_src1;
+            const int64_t s11 = src1_s11;
+            const int64_t s12 = src1_s12;
+            const int64_t s13 = src1_s13;
             if (use_native_fp4) {
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
@@ -314,11 +384,23 @@ void ggml_cuda_mul_mat_q(
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
-    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    // Not for the ternary types, whose ids may repeat an expert within a token or skip a slot (id < 0).
+    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1 && !is_tq;
 
-    {
-        GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
-        const int si1  = ids->nb[1] / ggml_element_size(ids);
+    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+    const int si1 = ids->nb[1] / ggml_element_size(ids);
+
+    if (is_tq) {
+        // one sorted row per (token, slot), repeated experts included; skipped slots get none. The rows past the
+        // last expert are quantized from row 0 of src1 and never read.
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream));
+        ggml_cuda_launch_mm_ids_helper_slots((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            ne02, ne12, n_expert_used, ne11, si1, src1_s12 / src1_s11, stream);
+        CUDA_CHECK(cudaGetLastError());
+        mmq_zero_skipped_slots<<<dim3(n_expert_used, ne12, 1), 256, 0, stream>>>(
+            (const int32_t *) ids->data, dst_d, ne0, si1, s1, s2);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
@@ -338,9 +420,9 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne13_flat = 1;
 
     {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
+        const int64_t s11 = src1_s11;
+        const int64_t s12 = src1_s12;
+        const int64_t s13 = src1_s13;
 
         if (use_native_fp4) {
             static constexpr size_t align_float8 = 32;
@@ -374,7 +456,10 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best, fusion_device};
+        // ternary types: an expert repeated within a token has more rows than tokens; the tiling kernel loops over
+        // the extra column tiles, the stream-k kernel needs them in the grid
+        is_tq && ggml_cuda_mmq_get_stream_k(src0->type, J_best, fallback, cc, prec_src1) ? ne_get_rows : ne12,
+        J_best, fusion_device};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
@@ -414,6 +499,18 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_NVFP4:
             mmq_supported = true;
             break;
+// -------------------------------------------------
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ1_0_X2:
+        case GGML_TYPE_TQ1_0_X3:
+        case GGML_TYPE_TQ1_0_X4:
+        case GGML_TYPE_TQ1_0R_1024:
+        case GGML_TYPE_TQ1_0R_1024_X2:
+        case GGML_TYPE_TQ1_0R_1024_X3:
+        case GGML_TYPE_TQ1_0R_1024_X4:
+            // GGML_CUDA_TQ_MMQ=0: previous batched path (fp16 decode + one cuBLAS GEMM per plane)
+            mmq_supported = ggml_cuda_tq_mmq_enabled();
+            break;
         default:
             mmq_supported = false;
             break;
@@ -434,6 +531,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
     if (turing_mma_available(cc)) {
         return true;
+    }
+
+    // ternary types: the alternative is a dequantization to fp16 and one BLAS GEMM per plane
+    if (ggml_cuda_tq_planes(type) > 0) {
+        return GGML_CUDA_CC_IS_AMD(cc) || ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A;
     }
 
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {

@@ -2125,6 +2125,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // ternary types (tq1r.cu): the TQ1_0R_1024 family always takes its own path (rotated activation: int8
     // mat-vec for ne11 <= 8, fp32-accumulated GEMM otherwise); the TQ1_0 family uses MMVQ for ne11 <= 8 and the
     // fp32-accumulated plain-decode GEMM for larger batches (one GEMM per plane, every plane exact in fp16).
+    // Batches above the mat-vec range use the int8 MMQ kernels (one tile per plane, rotated activation for the
+    // TQ1_0R_1024 family) unless GGML_CUDA_TQ_MMQ=0, which selects the fp16 decode + per-plane GEMM path.
+    if (ggml_cuda_tq_planes(src0->type) > 0 && ne11 > MMVQ_MAX_BATCH_SIZE &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ggml_cuda_should_use_mmq(src0->type, ggml_cuda_info().devices[ctx.device].cc, ne11, /*n_experts =*/ 0)) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     if (ggml_cuda_tq_is_r1024(src0->type)) {
         ggml_cuda_mul_mat_tq1r(ctx, src0, src1, nullptr, dst, /*force_batch =*/ false);
         return;
@@ -2195,8 +2203,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (ggml_cuda_tq_is_r1024(src0->type)) { // int8 mat-vec id up to TQ1R_MMID_MAX_BATCH tokens
-        return dst->ne[2] > TQ1R_MMID_MAX_BATCH;
+    if (ggml_cuda_tq_is_r1024(src0->type)) { // int8 mat-vec id up to TQ1R_MMID_MAX_BATCH tokens, then MMQ or sorted path
+        if (dst->ne[2] <= TQ1R_MMID_MAX_BATCH) {
+            return false;
+        }
+        return !ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2]);
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {

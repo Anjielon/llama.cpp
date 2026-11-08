@@ -1201,6 +1201,22 @@ struct ggml_cuda_type_traits<GGML_TYPE_TQ1_0_X4> {
     static constexpr int bs = sizeof(block_tq1_0_x4);
 };
 
+// TQ1_0R_1024 and its packed variants in MMQ: the 1024-block is handled as four 256-element quarters (one MMQ
+// iteration each); qk and bs describe a quarter, the loader recovers the 1024-block and the quarter from the index.
+#define DECL_TQ1R_TRAITS(T, B)                                \
+template<>                                                    \
+struct ggml_cuda_type_traits<T> {                             \
+    static constexpr int qk = QK_K;                           \
+    static constexpr int qr = 8;                              \
+    static constexpr int qi = 8;                              \
+    static constexpr int bs = sizeof(B)/4;                    \
+};
+DECL_TQ1R_TRAITS(GGML_TYPE_TQ1_0R_1024,    block_tq1_0r_1024)
+DECL_TQ1R_TRAITS(GGML_TYPE_TQ1_0R_1024_X2, block_tq1_0r_1024_x2)
+DECL_TQ1R_TRAITS(GGML_TYPE_TQ1_0R_1024_X3, block_tq1_0r_1024_x3)
+DECL_TQ1R_TRAITS(GGML_TYPE_TQ1_0R_1024_X4, block_tq1_0r_1024_x4)
+#undef DECL_TQ1R_TRAITS
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qk = QK_K;

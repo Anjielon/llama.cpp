@@ -52,6 +52,11 @@ static constexpr __host__ __device__ bool ggml_cuda_tq_is_tq1_0(const ggml_type 
            type == GGML_TYPE_TQ1_0_X3 || type == GGML_TYPE_TQ1_0_X4;
 }
 
+// Bytes of one plane (base block) of a ternary type: block_tq1_0 or block_tq1_0r_1024.
+static constexpr __host__ __device__ size_t ggml_cuda_tq_plane_bytes(const ggml_type type) {
+    return ggml_cuda_tq_is_r1024(type) ? sizeof(block_tq1_0r_1024) : sizeof(block_tq1_0);
+}
+
 // S, packed: bit (e & 31) of word (e >> 5) set <=> sign(e) = -1.
 // Same 1024 values as ggml_tq1_0r_1024_sign[] in ggml-quants.c and tq1_0r_1024_sign_word() in the Vulkan
 // shaders (numpy.random.default_rng(20260920).choice([-1.0, 1.0], size=1024)).
@@ -217,6 +222,11 @@ to_fp16_cuda_t ggml_cuda_tq1r_get_to_fp16(ggml_type type);
 //  - ids != nullptr: MUL_MAT_ID, only for n_tokens <= TQ1R_MMID_MAX_BATCH (int8 mat-vec per (token, slot)).
 void ggml_cuda_mul_mat_tq1r(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                             const ggml_tensor * ids, ggml_tensor * dst, bool force_batch);
+
+// Rotated activation for the MMQ path of TQ1_0R_1024[_XK]: y = (1/32) H_1024 (S x) for every 1024-chunk of every
+// row of the strided [ne10, ne11, ne12, ne13] x (element strides s11, s12, s13); y is contiguous.
+void ggml_cuda_tq1r_rotate_f32(const float * x, float * y, int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+                               int64_t s11, int64_t s12, int64_t s13, cudaStream_t stream);
 
 // Batched GEMM for every ternary type above: plain (exact) fp16 decode of each plane, rotated activation for the
 // TQ1_0R_1024 family, one fp32-accumulated GEMM per plane. Used for TQ1_0[_XK] batches (instead of the generic
