@@ -2818,7 +2818,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
                 const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
-                GGML_ASSERT(id >= 0 && id < n_expert);
+                if (id < 0) {
+                    continue; // empty slot (sparse expert planes): no expert to copy
+                }
+                GGML_ASSERT(id < n_expert);
                 st.used[id] = true;
             }
         }
