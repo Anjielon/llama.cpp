@@ -1027,40 +1027,40 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
 #pragma unroll 1
-    for (int pl = 0; pl < nplanes; ++pl) {
-        load_tiles(x + pl*plane_bytes, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
-        {
-            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+        for (int pl = 0; pl < nplanes; ++pl) {
+            load_tiles(x + pl*plane_bytes, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                    tile_y[l] = by0[l];
+                }
             }
-        }
 
-        __syncthreads();
+            __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, 0);
+            vec_dot(tile_x, tile_y, sum, 0);
 
-        __syncthreads();
+            __syncthreads();
 
-        {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                    tile_y[l] = by0[l];
+                }
             }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
         }
-
-        __syncthreads();
-
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
-
-        __syncthreads();
-    }
     }
 
     if (fixup) {
@@ -1134,71 +1134,71 @@ static __global__ void mul_mat_q(
         constexpr bool loop_jt = ggml_cuda_tq_planes(type) > 0;
         for (int jt = blockIdx.x; ; jt += gridDim.x) {
 
-        // Defaults for regular matrix multiplication:
-        int col_low    = 0;
-        int col_high   = ncols_dst;
-        int col_diff   = ncols_dst;
-        int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
-        int offset_y_scale;
-        if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
-        } else {
-            GGML_UNUSED(offset_y_scale);
-        }
-
-        if (ids_dst) {
-            col_low  = expert_bounds[zt + 0];
-            col_high = expert_bounds[zt + 1];
-            col_diff = col_high - col_low;
-
-            offset_y   = 0;
-            offset_dst = 0;
+            // Defaults for regular matrix multiplication:
+            int col_low    = 0;
+            int col_high   = ncols_dst;
+            int col_diff   = ncols_dst;
+            int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
+            int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+            int offset_y_scale;
             if constexpr (type == GGML_TYPE_NVFP4) {
-                offset_y_scale = 0;
+                offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
+            } else {
+                GGML_UNUSED(offset_y_scale);
             }
 
-            if (jt*J >= col_diff) {
-                return;
-            }
+            if (ids_dst) {
+                col_low  = expert_bounds[zt + 0];
+                col_high = expert_bounds[zt + 1];
+                col_diff = col_high - col_low;
 
-            if (loop_jt && jt != (int) blockIdx.x) {
-                __syncthreads(); // the previous tile of this block is done with ids_dst_shared
-            }
-#pragma unroll
-            for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
-                const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
-
-                if (j0 + nwarps*warp_size > J && j >= J) {
-                    break;
+                offset_y   = 0;
+                offset_dst = 0;
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    offset_y_scale = 0;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                if (jt*J >= col_diff) {
+                    return;
+                }
+
+                if (loop_jt && jt != (int) blockIdx.x) {
+                    __syncthreads(); // the previous tile of this block is done with ids_dst_shared
+                }
+    #pragma unroll
+                for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+                    const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    if (j0 + nwarps*warp_size > J && j >= J) {
+                        break;
+                    }
+
+                    ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                }
+                __syncthreads();
             }
-            __syncthreads();
-        }
 
-        offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
-        offset_dst += it*I_dst;
-        const float * y_scale_tile = nullptr;
-        if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale += col_low + jt*J;
-            y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
-        }
+            offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+            offset_dst += it*I_dst;
+            const float * y_scale_tile = nullptr;
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                offset_y_scale += col_low + jt*J;
+                y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
+            }
 
-        const int tile_x_max_i = nrows_x  - it*I_dst - 1;
-        const int tile_y_max_j = col_diff - jt*J - 1;
+            const int tile_x_max_i = nrows_x  - it*I_dst - 1;
+            const int tile_y_max_j = col_diff - jt*J - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I_dst*stride_row_x;
+            const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I_dst*stride_row_x;
 
-        constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, has_fusion>
-            (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
-             glu_op, glu_limit, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
-        if (!loop_jt || !ids_dst) {
-            return;
-        }
+            constexpr bool fixup = false;
+            mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, has_fusion>
+                (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+                 glu_op, glu_limit, stride_row_x, ncols_y, stride_col_dst,
+                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+            if (!loop_jt || !ids_dst) {
+                return;
+            }
         }
     }
 
