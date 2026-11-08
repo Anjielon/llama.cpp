@@ -2303,7 +2303,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                assert(expert_to_use < ne02);
                 if (expert_to_use == i02) {
                     // no break: a token may select the same expert in more than one slot (e.g. sparse
                     // expert planes, where every expert without a plane maps to the same slot); each
@@ -2315,7 +2315,21 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
+    // empty slots (id -1, sparse expert planes): one sorted row each after all expert blocks; no expert writes
+    // it, so it stays zero (dst_sorted is cleared below) and the slot contributes nothing, as on the CPU backend
+    for (int64_t i12 = 0; i12 < ne12; ++i12) {
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+            if (expert_to_use < 0) {
+                ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
+                ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
+            }
+        }
+    }
     GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    if (ids_to_sorted_host.size() > 0) {
+        CUDA_CHECK(cudaMemsetAsync(dst_sorted.ptr, 0, ne2*n_expert_used*ne0*ts_dst_sorted, stream));
+    }
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
