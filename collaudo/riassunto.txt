@@ -1,4 +1,0 @@
-MUL_MAT q8=0 rc 124 280 ok 0 fail
-MUL_MAT_ID q8=0 rc 0 1139 ok 0 fail
-MUL_MAT q8=1 rc 0 2474 ok 0 fail
-MUL_MAT_ID q8=1 rc 0 1139 ok 0 fail
