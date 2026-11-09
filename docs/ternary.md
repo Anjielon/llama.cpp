@@ -16,6 +16,14 @@ Mixture-of-experts tensors may carry a second, sparse plane: a separate tensor `
 second plane only for some experts, plus an F32 slot map. Experts without a second plane have slot id `-1` and
 contribute zero for that plane.
 
+## Requirements
+
+- CMake >= 3.18 and a C++17 compiler (GCC 11+, Clang 14+, MSVC 2022).
+- Vulkan: Vulkan SDK or headers + loader >= 1.3, `glslc`, SPIRV-Headers; GPU with `VK_KHR_shader_integer_dot_product` for the int8 paths (tested: Radeon 8060S gfx1151, Mesa 25.3.6).
+- CUDA: CUDA Toolkit >= 12.0 (tested: RTX 4060 Laptop, sm_89).
+- ROCm: ROCm >= 6.2 (tested: gfx1151).
+- CPU: x86-64 with AVX2 (AVX-512 used when available).
+
 ## Build
 
 Vulkan (recommended on AMD and Intel GPUs):
