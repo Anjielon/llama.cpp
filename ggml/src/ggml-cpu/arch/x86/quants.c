@@ -1561,8 +1561,30 @@ static inline __m256i tq1_trit(const __m256i xb) {
     return _mm256_sub_epi8(_mm256_sub_epi8(_mm256_setzero_si256(), c1), c2);
 }
 
-// dot of the 256 trits (0..2, no -1 offset) of one TQ1_0 layout block with 256 int8 activations, as int16 lanes:
-// *h0 sums the elements 0..127, *h1 the elements 128..255 (|lane| <= 4 * 2 * 2 * 127 each)
+// partial dot accumulators: int32 lanes with VNNI (u8 x s8 -> s32), else int16 lanes (|lane| <= 4 * 2 * 2 * 127)
+#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
+static inline __m256i tq1_dot_acc(const __m256i acc, const __m256i t, const __m256i y) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_dpbusd_epi32(acc, t, y);
+#else
+    return _mm256_dpbusd_avx_epi32(acc, t, y);
+#endif
+}
+static inline __m256i tq1_dot_first(const __m256i t, const __m256i y) { return tq1_dot_acc(_mm256_setzero_si256(), t, y); }
+static inline __m256i tq1_acc_add(const __m256i a, const __m256i b) { return _mm256_add_epi32(a, b); }
+// accumulator minus 16 int16 activation sums
+static inline __m256i tq1_acc_sub_bsums(const __m256i a, const __m256i bs) { return _mm256_sub_epi32(a, _mm256_madd_epi16(bs, _mm256_set1_epi16(1))); }
+static inline __m256i tq1_acc_i32(const __m256i a) { return a; }
+#else
+static inline __m256i tq1_dot_acc(const __m256i acc, const __m256i t, const __m256i y) { return _mm256_add_epi16(acc, _mm256_maddubs_epi16(t, y)); }
+static inline __m256i tq1_dot_first(const __m256i t, const __m256i y) { return _mm256_maddubs_epi16(t, y); }
+static inline __m256i tq1_acc_add(const __m256i a, const __m256i b) { return _mm256_add_epi16(a, b); }
+static inline __m256i tq1_acc_sub_bsums(const __m256i a, const __m256i bs) { return _mm256_sub_epi16(a, bs); }
+static inline __m256i tq1_acc_i32(const __m256i a) { return _mm256_madd_epi16(a, _mm256_set1_epi16(1)); }
+#endif
+
+// dot of the 256 trits (0..2, no -1 offset) of one TQ1_0 layout block with 256 int8 activations, as accumulator
+// lanes (tq1_dot_acc): *h0 sums the elements 0..127, *h1 the elements 128..255
 static inline void tq1_quarter_dot(const uint8_t * GGML_RESTRICT qs, const uint8_t * GGML_RESTRICT qh,
                                    const int8_t * GGML_RESTRICT y, __m256i * h0, __m256i * h1) {
     const __m256i bias = _mm256_set1_epi8((char) 0x80);
@@ -1573,11 +1595,11 @@ static inline void tq1_quarter_dot(const uint8_t * GGML_RESTRICT qs, const uint8
     const __m256i x2 = tq1_mul9(x0);
     const __m256i x3 = tq1_mul9(x1);
     const __m256i x4 = tq1_mul9(x2);
-    const __m256i p0 = _mm256_maddubs_epi16(tq1_trit(x0), _mm256_loadu_si256((const __m256i *) (y +   0)));
-    const __m256i p1 = _mm256_maddubs_epi16(tq1_trit(x1), _mm256_loadu_si256((const __m256i *) (y +  32)));
-    const __m256i p2 = _mm256_maddubs_epi16(tq1_trit(x2), _mm256_loadu_si256((const __m256i *) (y +  64)));
-    const __m256i p3 = _mm256_maddubs_epi16(tq1_trit(x3), _mm256_loadu_si256((const __m256i *) (y +  96)));
-    __m256i s1       = _mm256_maddubs_epi16(tq1_trit(x4), _mm256_loadu_si256((const __m256i *) (y + 128)));
+    __m256i p0 = tq1_dot_first(tq1_trit(x0), _mm256_loadu_si256((const __m256i *) (y +   0)));
+    __m256i p1 = tq1_dot_first(tq1_trit(x1), _mm256_loadu_si256((const __m256i *) (y +  32)));
+    p0 = tq1_dot_acc(p0, tq1_trit(x2), _mm256_loadu_si256((const __m256i *) (y +  64)));
+    p1 = tq1_dot_acc(p1, tq1_trit(x3), _mm256_loadu_si256((const __m256i *) (y +  96)));
+    __m256i s1 = tq1_dot_first(tq1_trit(x4), _mm256_loadu_si256((const __m256i *) (y + 128)));
 
     // qs[32..47]: 5 trits each -> elements 160 + l*16 + m, two trit rows per 256-bit vector
     const __m256i t   = _mm256_xor_si256(_mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (qs + 32))), bias);
@@ -1591,12 +1613,12 @@ static inline void tq1_quarter_dot(const uint8_t * GGML_RESTRICT qs, const uint8
     const __m128i q5b = _mm_xor_si128(_mm_packus_epi16(_mm256_castsi256_si128(q5), _mm256_extracti128_si256(q5, 1)), _mm_set1_epi8((char) 0x80));
     const __m256i t45 = _mm256_inserti128_si256(tq1_mul9(t23), q5b, 1);                                               // 81x | qh
 
-    s1 = _mm256_add_epi16(s1, _mm256_maddubs_epi16(tq1_trit(t01), _mm256_loadu_si256((const __m256i *) (y + 160))));
-    s1 = _mm256_add_epi16(s1, _mm256_maddubs_epi16(tq1_trit(t23), _mm256_loadu_si256((const __m256i *) (y + 192))));
-    s1 = _mm256_add_epi16(s1, _mm256_maddubs_epi16(tq1_trit(t45), _mm256_loadu_si256((const __m256i *) (y + 224))));
+    __m256i s2 = tq1_dot_first(tq1_trit(t01), _mm256_loadu_si256((const __m256i *) (y + 160)));
+    s1 = tq1_dot_acc(s1, tq1_trit(t23), _mm256_loadu_si256((const __m256i *) (y + 192)));
+    s2 = tq1_dot_acc(s2, tq1_trit(t45), _mm256_loadu_si256((const __m256i *) (y + 224)));
 
-    *h0 = _mm256_add_epi16(_mm256_add_epi16(p0, p1), _mm256_add_epi16(p2, p3));
-    *h1 = s1;
+    *h0 = tq1_acc_add(p0, p1);
+    *h1 = tq1_acc_add(s1, s2);
 }
 
 // TQ1_0 and its packed planes: per block, the planes share the Q8_K activation block; the -1 offset of the trits
@@ -1616,7 +1638,7 @@ static inline float tq1_0_planes_dot(const int n, const void * GGML_RESTRICT vx,
             tq1_quarter_dot(xb->qs, xb->qh, y[i].qs, &h0, &h1);
             const float d = GGML_CPU_FP16_TO_FP32(xb->d);
             dsum += d;
-            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_add_epi16(h0, h1), ones)), _mm256_set1_ps(yd * d), acc);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(tq1_acc_i32(tq1_acc_add(h0, h1))), _mm256_set1_ps(yd * d), acc);
         }
         const __m256i bs = _mm256_madd_epi16(_mm256_loadu_si256((const __m256i *) y[i].bsums), ones);
         accb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(bs), _mm256_set1_ps(yd * dsum), accb);
@@ -1628,7 +1650,6 @@ static inline float tq1_0_planes_dot(const int n, const void * GGML_RESTRICT vx,
 static inline float tq1_0r_1024_planes_dot(const int n, const void * GGML_RESTRICT vx, const block_q8_K * GGML_RESTRICT y, const int K) {
     const int nb = n / QK_TQ1_0R_1024;
     const block_tq1_0r_1024 * GGML_RESTRICT x = (const block_tq1_0r_1024 *) vx;
-    const __m256i ones = _mm256_set1_epi16(1);
     const __m256i lo   = _mm256_set_epi64x(0, 0, -1, -1); // bsums 0..7 cover the elements 0..127
     __m256 acc = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
@@ -1641,8 +1662,8 @@ static inline float tq1_0r_1024_planes_dot(const int n, const void * GGML_RESTRI
                 const block_tq1_0r_1024 * GGML_RESTRICT xb = x + i*K + p;
                 __m256i h0, h1;
                 tq1_quarter_dot(xb->qs[q], xb->qh[q], yb->qs, &h0, &h1);
-                h0 = _mm256_madd_epi16(_mm256_sub_epi16(h0, bs0), ones);
-                h1 = _mm256_madd_epi16(_mm256_sub_epi16(h1, bs1), ones);
+                h0 = tq1_acc_i32(tq1_acc_sub_bsums(h0, bs0));
+                h1 = tq1_acc_i32(tq1_acc_sub_bsums(h1, bs1));
                 acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(h0), _mm256_set1_ps(yb->d * GGML_CPU_FP16_TO_FP32(xb->d[2*q])),     acc);
                 acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(h1), _mm256_set1_ps(yb->d * GGML_CPU_FP16_TO_FP32(xb->d[2*q + 1])), acc);
             }
