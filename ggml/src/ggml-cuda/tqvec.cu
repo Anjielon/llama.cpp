@@ -1,8 +1,9 @@
 // Ternary types on CUDA: batch-1..8 mat-vec (MUL_MAT ne11 <= 8, MUL_MAT_ID n_tokens <= 8) for both families,
 // TQ1_0[_XK] and TQ1_0R_1024[_XK], one kernel.
 //
-// Activation: int8 in natural element order with one fp32 scale and one int32 sum per 128 elements, rotated per
-// 1024-chunk first for the TQ1_0R_1024 family (y = (1/32) H_1024 (S x), as in tq1r.cu).
+// Activation: int8 in natural element order with one fp32 scale and one int32 sum per GS elements (GS = 128 for the
+// TQ1_0R_1024 family, whose activation is rotated per 1024-chunk first: y = (1/32) H_1024 (S x) as in tq1r.cu;
+// GS = 32 for the TQ1_0 family, whose activation is not rotated: the granularity of the q8_1 path it replaces).
 //
 // Weight: both families are groups of 256 trits laid out like block_tq1_0 (qs[48]: 5 digits per byte, qh[4]: 4
 // digits per byte). Unit of work = one 32-bit word of a group (12 qs words + 1 qh word). For digit t the 4 bytes
@@ -11,8 +12,8 @@
 //   qs word r 8..11: element 160 + 16t + 4(r-8)        all in the second 128
 //   qh word        : element 240 + 4t      (t = 0..3)  all in the second 128
 // The digits are decoded in registers (SWAR Horner, bytes 0,2 and 1,3 in 16-bit fields: c_(t+1) = 3 c_t mod 256,
-// digit_t = (3 c_t) >> 8). trit = digit - 1: the int8 sum of each 128 of the activation is subtracted once, by the
-// lane that handles word 0 of the group. The K packed planes of a word share the activation words.
+// digit_t = (3 c_t) >> 8). trit = digit - 1: the int8 sums of the activation are subtracted once, by the lane
+// that handles word 0 of the group. The K packed planes of a word share the activation words.
 //
 // Thread mapping: one warp = R consecutive rows, lanes stride over the words of the row; the activation words of
 // a lane are loaded once and reused by the R rows, the K planes and (ncols > 1) the decode by the ncols columns.
@@ -35,7 +36,7 @@ static int tqvec_env_int(const char * name, int def) {
 // Activation quantization. One 256-thread CUDA block per (1024-chunk, row); warp w owns elements
 // [128w, 128w + 128) of the chunk, lane l elements 128w + 4l .. 128w + 4l + 3.
 
-template <bool ROTATE, typename src_t>
+template <bool ROTATE, int GS, typename src_t>
 static __global__ void __launch_bounds__(256) k_tqvec_q8(
         const src_t * __restrict__ x, uint32_t * __restrict__ yw, float * __restrict__ ys, int * __restrict__ yi,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nrows,
@@ -76,7 +77,7 @@ static __global__ void __launch_bounds__(256) k_tqvec_q8(
 
             float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
 #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
+            for (int off = GS/8; off > 0; off >>= 1) { // GS/4 lanes per scale group
                 amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, off, 32));
             }
             const float inv = amax > 0.0f ? __fdiv_rn(127.0f, amax) : 0.0f;
@@ -90,13 +91,13 @@ static __global__ void __launch_bounds__(256) k_tqvec_q8(
                 pk |= ((uint32_t) q & 255u) << (8*k);
             }
 #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
+            for (int off = GS/8; off > 0; off >>= 1) {
                 isum += __shfl_xor_sync(0xFFFFFFFF, isum, off, 32);
             }
             yw[r*(ne10/4) + e0/4] = pk;
-            if (lane == 0) {
-                ys[r*(ne10/128) + e0/128] = __fdiv_rn(amax, 127.0f);
-                yi[r*(ne10/128) + e0/128] = isum;
+            if (lane % (GS/4) == 0) {
+                ys[r*(ne10/GS) + e0/GS] = __fdiv_rn(amax, 127.0f);
+                yi[r*(ne10/GS) + e0/GS] = isum;
             }
         }
     }
@@ -108,8 +109,8 @@ static __global__ void __launch_bounds__(256) k_tqvec_q8(
 struct tqvec_params {
     const char     * w;      // src0 data
     const uint32_t * yw;     // int8x4 activation, nq*64 words per activation row
-    const float    * ys;     // scale per 128, nq*2 per activation row
-    const int      * yi;     // int8 sum per 128, nq*2 per activation row
+    const float    * ys;     // scale per GS, nq*256/GS per activation row
+    const int      * yi;     // int8 sum per GS, nq*256/GS per activation row
     float          * dst;
     const int32_t  * ids;    // MUL_MAT_ID only
     int     nq;              // groups of 256 per weight row
@@ -140,7 +141,7 @@ static __device__ __forceinline__ void tqvec_decode(const uint32_t w, int D[5]) 
     }
 }
 
-template <bool R1024, int K, int ncols, int R>
+template <bool R1024, int GS, int K, int ncols, int R>
 static __global__ void __launch_bounds__(256) k_tqvec(const tqvec_params p) {
     const int lane = threadIdx.x;
     const int64_t row0 = ((int64_t) blockIdx.x*blockDim.y + threadIdx.y)*R;
@@ -184,7 +185,8 @@ static __global__ void __launch_bounds__(256) k_tqvec(const tqvec_params p) {
     }
 
     const int64_t yw_row = (int64_t) p.nq*64;
-    const int64_t ys_row = (int64_t) p.nq*2;
+    constexpr int NG = 256/GS; // scale groups per group of 256
+    const int64_t ys_row = (int64_t) p.nq*NG;
     const int nws = p.nq*13;
 
     for (int f = lane; f < nws; f += WARP_SIZE) {
@@ -196,8 +198,10 @@ static __global__ void __launch_bounds__(256) k_tqvec(const tqvec_params p) {
         const int ys = c1 ? 8 : (has5 ? 4 : 1);
 
         int   Y[ncols][5];
-        float sl[ncols], sh[ncols];
-        int   Sl[ncols], Sh[ncols];
+        float sl[ncols], sh[ncols];   // GS == 128: scale of the two 128
+        int   Sl[ncols], Sh[ncols];   // GS == 128: int8 sums of the two 128 (word 0 only)
+        float sc[ncols][5];           // GS == 32: scale of the 32 of digit t
+        float ol[ncols], oh[ncols];   // GS == 32: sum of scale*int8 sum over the 32s of each 128 (word 0 only)
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
             const uint32_t * yb = p.yw + (ycol0 + j)*yw_row + g*64 + y0;
@@ -206,16 +210,27 @@ static __global__ void __launch_bounds__(256) k_tqvec(const tqvec_params p) {
                 Y[j][t] = (int) yb[t*ys];
             }
             Y[j][4] = has5 ? (int) yb[4*ys] : 0;
-            const float2 s = *((const float2 *) (p.ys + (ycol0 + j)*ys_row) + g);
-            sl[j] = s.x;
-            sh[j] = s.y;
-            if (r == 0) {
-                const int2 S = *((const int2 *) (p.yi + (ycol0 + j)*ys_row) + g);
-                Sl[j] = S.x;
-                Sh[j] = S.y;
+            const float * ysg = p.ys + (ycol0 + j)*ys_row + g*NG;
+            const int   * yig = p.yi + (ycol0 + j)*ys_row + g*NG;
+            if constexpr (GS == 128) {
+                sl[j] = ysg[0];
+                sh[j] = ysg[1];
+                Sl[j] = r == 0 ? yig[0] : 0;
+                Sh[j] = r == 0 ? yig[1] : 0;
             } else {
-                Sl[j] = 0;
-                Sh[j] = 0;
+#pragma unroll
+                for (int t = 0; t < 5; ++t) { // the 32 of digit t: t (r < 8), 5 + t/2 (r 8..11), 7 (qh)
+                    sc[j][t] = ysg[c1 ? t : (has5 ? 5 + (t >> 1) : 7)];
+                }
+                ol[j] = 0.0f;
+                oh[j] = 0.0f;
+                if (r == 0) {
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+                        ol[j] += ysg[b    ]*(float) yig[b    ];
+                        oh[j] += ysg[b + 4]*(float) yig[b + 4];
+                    }
+                }
             }
         }
 
@@ -250,18 +265,31 @@ static __global__ void __launch_bounds__(256) k_tqvec(const tqvec_params p) {
                     tqvec_decode(w, D);
 #pragma unroll
                     for (int j = 0; j < ncols; ++j) {
-                        const int ilo = ggml_cuda_dp4a(D[3], Y[j][3], ggml_cuda_dp4a(D[2], Y[j][2],
-                                        ggml_cuda_dp4a(D[1], Y[j][1], ggml_cuda_dp4a(D[0], Y[j][0], 0)))) - Sl[j];
-                        const int ihi = ggml_cuda_dp4a(D[4], Y[j][4], 0) - Sh[j];
-                        const int lo  = c1 ? ilo : 0;
-                        const int hi  = c1 ? ihi : ilo + ihi;
-                        al[j] += d0*(float) lo;
-                        ah[j] += d1*(float) hi;
+                        if constexpr (GS == 128) {
+                            const int ilo = ggml_cuda_dp4a(D[3], Y[j][3], ggml_cuda_dp4a(D[2], Y[j][2],
+                                            ggml_cuda_dp4a(D[1], Y[j][1], ggml_cuda_dp4a(D[0], Y[j][0], 0)))) - Sl[j];
+                            const int ihi = ggml_cuda_dp4a(D[4], Y[j][4], 0) - Sh[j];
+                            const int lo  = c1 ? ilo : 0;
+                            const int hi  = c1 ? ihi : ilo + ihi;
+                            al[j] += d0*(float) lo;
+                            ah[j] += d1*(float) hi;
+                        } else {
+                            float fd[5];
+#pragma unroll
+                            for (int t = 0; t < 5; ++t) {
+                                fd[t] = sc[j][t]*(float) ggml_cuda_dp4a(D[t], Y[j][t], 0);
+                            }
+                            const float f03 = (fd[0] + fd[1]) + (fd[2] + fd[3]);
+                            const float lo  = c1 ? f03 : 0.0f;
+                            const float hi  = c1 ? fd[4] : f03 + fd[4];
+                            al[j] += d0*(lo - ol[j]);
+                            ah[j] += d1*(hi - oh[j]);
+                        }
                     }
                 }
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
-                    temp[j][n] += sl[j]*al[j] + sh[j]*ah[j];
+                    temp[j][n] += GS == 128 ? sl[j]*al[j] + sh[j]*ah[j] : al[j] + ah[j];
                 }
             }
         }
@@ -279,7 +307,7 @@ static __global__ void __launch_bounds__(256) k_tqvec(const tqvec_params p) {
     }
 }
 
-template <bool R1024, int K>
+template <bool R1024, int GS, int K>
 static void tqvec_launch_k(const tqvec_params & p, const int ncols, const int R, const int nwarps, const dim3 gyz,
                            cudaStream_t stream) {
     const dim3 block(WARP_SIZE, nwarps, 1);
@@ -288,31 +316,31 @@ static void tqvec_launch_k(const tqvec_params & p, const int ncols, const int R,
     switch (ncols) {
         case 1:
             switch (R) {
-                case 1:  k_tqvec<R1024, K, 1, 1><<<grid, block, 0, stream>>>(p); break;
-                case 2:  k_tqvec<R1024, K, 1, 2><<<grid, block, 0, stream>>>(p); break;
-                case 4:  k_tqvec<R1024, K, 1, 4><<<grid, block, 0, stream>>>(p); break;
+                case 1:  k_tqvec<R1024, GS, K, 1, 1><<<grid, block, 0, stream>>>(p); break;
+                case 2:  k_tqvec<R1024, GS, K, 1, 2><<<grid, block, 0, stream>>>(p); break;
+                case 4:  k_tqvec<R1024, GS, K, 1, 4><<<grid, block, 0, stream>>>(p); break;
                 default: GGML_ABORT("tq vec: unsupported rows per warp %d", R);
             }
             break;
-        case 2: k_tqvec<R1024, K, 2, 1><<<grid, block, 0, stream>>>(p); break;
-        case 3: k_tqvec<R1024, K, 3, 1><<<grid, block, 0, stream>>>(p); break;
-        case 4: k_tqvec<R1024, K, 4, 1><<<grid, block, 0, stream>>>(p); break;
-        case 5: k_tqvec<R1024, K, 5, 1><<<grid, block, 0, stream>>>(p); break;
-        case 6: k_tqvec<R1024, K, 6, 1><<<grid, block, 0, stream>>>(p); break;
-        case 7: k_tqvec<R1024, K, 7, 1><<<grid, block, 0, stream>>>(p); break;
-        case 8: k_tqvec<R1024, K, 8, 1><<<grid, block, 0, stream>>>(p); break;
+        case 2: k_tqvec<R1024, GS, K, 2, 1><<<grid, block, 0, stream>>>(p); break;
+        case 3: k_tqvec<R1024, GS, K, 3, 1><<<grid, block, 0, stream>>>(p); break;
+        case 4: k_tqvec<R1024, GS, K, 4, 1><<<grid, block, 0, stream>>>(p); break;
+        case 5: k_tqvec<R1024, GS, K, 5, 1><<<grid, block, 0, stream>>>(p); break;
+        case 6: k_tqvec<R1024, GS, K, 6, 1><<<grid, block, 0, stream>>>(p); break;
+        case 7: k_tqvec<R1024, GS, K, 7, 1><<<grid, block, 0, stream>>>(p); break;
+        case 8: k_tqvec<R1024, GS, K, 8, 1><<<grid, block, 0, stream>>>(p); break;
         default: GGML_ABORT("tq vec: unsupported ncols %d", ncols);
     }
 }
 
-template <bool R1024>
+template <bool R1024, int GS>
 static void tqvec_launch(const tqvec_params & p, const int K, const int ncols, const int R, const int nwarps,
                          const dim3 gyz, cudaStream_t stream) {
     switch (K) {
-        case 1: tqvec_launch_k<R1024, 1>(p, ncols, R, nwarps, gyz, stream); break;
-        case 2: tqvec_launch_k<R1024, 2>(p, ncols, R, nwarps, gyz, stream); break;
-        case 3: tqvec_launch_k<R1024, 3>(p, ncols, R, nwarps, gyz, stream); break;
-        case 4: tqvec_launch_k<R1024, 4>(p, ncols, R, nwarps, gyz, stream); break;
+        case 1: tqvec_launch_k<R1024, GS, 1>(p, ncols, R, nwarps, gyz, stream); break;
+        case 2: tqvec_launch_k<R1024, GS, 2>(p, ncols, R, nwarps, gyz, stream); break;
+        case 3: tqvec_launch_k<R1024, GS, 3>(p, ncols, R, nwarps, gyz, stream); break;
+        case 4: tqvec_launch_k<R1024, GS, 4>(p, ncols, R, nwarps, gyz, stream); break;
         default: GGML_ABORT("tq vec: unsupported number of planes %d", K);
     }
 }
@@ -346,7 +374,10 @@ void ggml_cuda_mul_mat_tq_vec(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t s11 = nb11/ts1, s12 = nb12/ts1, s13 = nb13/ts1;
     const int64_t nrows1 = ne11*ne12*ne13;
 
-    const int64_t nw = (int64_t) nq*64, ns = (int64_t) nq*2;
+    // activation scale group: 128 for the rotated family, 32 for the TQ1_0 family; GGML_CUDA_TQ_VEC_GS=32|128 forces
+    static const int env_gs = tqvec_env_int("GGML_CUDA_TQ_VEC_GS", 0);
+    const int GS = env_gs == 32 || env_gs == 128 ? env_gs : (r1024 ? 128 : 32);
+    const int64_t nw = (int64_t) nq*64, ns = (int64_t) nq*(256/GS);
     ggml_cuda_pool_alloc<uint32_t> ybuf(ctx.pool(), nrows1*(nw + 2*ns));
     uint32_t * yw = ybuf.get();
     float    * ys = (float *) (yw + nrows1*nw);
@@ -356,15 +387,15 @@ void ggml_cuda_mul_mat_tq_vec(ggml_backend_cuda_context & ctx, const ggml_tensor
         const dim3 grid((unsigned) MIN((ne10 + 1023)/1024, (int64_t) 65535), (unsigned) MIN(nrows1, (int64_t) 65535), 1);
         if (src1->type == GGML_TYPE_F32) {
             if (r1024) {
-                k_tqvec_q8<true,  float><<<grid, 256, 0, stream>>>((const float *) src1->data, yw, ys, yi, ne10, ne11, ne12, nrows1, s11, s12, s13);
+                (GS == 128 ? k_tqvec_q8<true , 128, float> : k_tqvec_q8<true , 32, float>)<<<grid, 256, 0, stream>>>((const float *) src1->data, yw, ys, yi, ne10, ne11, ne12, nrows1, s11, s12, s13);
             } else {
-                k_tqvec_q8<false, float><<<grid, 256, 0, stream>>>((const float *) src1->data, yw, ys, yi, ne10, ne11, ne12, nrows1, s11, s12, s13);
+                (GS == 128 ? k_tqvec_q8<false, 128, float> : k_tqvec_q8<false, 32, float>)<<<grid, 256, 0, stream>>>((const float *) src1->data, yw, ys, yi, ne10, ne11, ne12, nrows1, s11, s12, s13);
             }
         } else {
             if (r1024) {
-                k_tqvec_q8<true,  half><<<grid, 256, 0, stream>>>((const half *) src1->data, yw, ys, yi, ne10, ne11, ne12, nrows1, s11, s12, s13);
+                (GS == 128 ? k_tqvec_q8<true , 128, half> : k_tqvec_q8<true , 32, half>)<<<grid, 256, 0, stream>>>((const half *) src1->data, yw, ys, yi, ne10, ne11, ne12, nrows1, s11, s12, s13);
             } else {
-                k_tqvec_q8<false, half><<<grid, 256, 0, stream>>>((const half *) src1->data, yw, ys, yi, ne10, ne11, ne12, nrows1, s11, s12, s13);
+                (GS == 128 ? k_tqvec_q8<false, 128, half> : k_tqvec_q8<false, 32, half>)<<<grid, 256, 0, stream>>>((const half *) src1->data, yw, ys, yi, ne10, ne11, ne12, nrows1, s11, s12, s13);
             }
         }
         CUDA_CHECK(cudaGetLastError());
@@ -415,9 +446,11 @@ void ggml_cuda_mul_mat_tq_vec(ggml_backend_cuda_context & ctx, const ggml_tensor
         R = blocks4 >= 2*nsm ? 4 : 2;
     }
     if (r1024) {
-        tqvec_launch<true >(p, K, ncols, R, nwarps, gyz, stream);
+        if (GS == 128) { tqvec_launch<true,  128>(p, K, ncols, R, nwarps, gyz, stream); }
+        else           { tqvec_launch<true,   32>(p, K, ncols, R, nwarps, gyz, stream); }
     } else {
-        tqvec_launch<false>(p, K, ncols, R, nwarps, gyz, stream);
+        if (GS == 128) { tqvec_launch<false, 128>(p, K, ncols, R, nwarps, gyz, stream); }
+        else           { tqvec_launch<false,  32>(p, K, ncols, R, nwarps, gyz, stream); }
     }
     CUDA_CHECK(cudaGetLastError());
 }
