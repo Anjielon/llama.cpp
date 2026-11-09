@@ -1668,6 +1668,14 @@ static void ggml_compute_forward_mul_mat_id(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
+    // few-token path: the used experts in order, and one shared counter of (expert, row chunk) work items
+    int32_t * active_experts = // [n_as]
+        incr_ptr_aligned(&wdata_cur, n_as*sizeof(int32_t), sizeof(int64_t));
+    char * few_tok = incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE, CACHE_LINE_SIZE);
+    atomic_int * few_tok_next     = (atomic_int *) few_tok;
+    int32_t    * few_tok_n_active = (int32_t *) (few_tok + sizeof(atomic_int));
+    const bool   few_tokens       = ids->ne[1] <= 4;
+
     // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
     // reservation is unconditional, the per expert eligibility is decided at dispatch time
     char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
@@ -1731,6 +1739,17 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        if (few_tokens) {
+            int32_t n_active = 0;
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                if (matrix_row_counts[cur_a] > 0) {
+                    active_experts[n_active++] = cur_a;
+                }
+            }
+            *few_tok_n_active = n_active;
+            atomic_store_explicit(few_tok_next, nth, memory_order_relaxed);
+        }
     }
 
     // reset current_chunk
@@ -1740,6 +1759,32 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     ggml_barrier(params->threadpool);
+
+    if (few_tokens) {
+        // token generation: each used expert has at most a few columns, so a static split of its rows over the
+        // threads leaves the faster cores of a hybrid CPU waiting for the slower ones at every expert. Instead all
+        // the threads take (expert, row chunk) items of all the used experts from one counter, in expert order.
+        const void  * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const size_t  row_size = ggml_row_size(vec_dot_type, ne10);
+        const int64_t nr0      = ne01;
+        int64_t rows = 32768 / MAX(ne00, 1); // about 32k weights per item
+        rows = MIN(MAX(16, (rows + 15) & ~(int64_t) 15), MAX(nr0, 16));
+        const int64_t nchunk0 = (nr0 + rows - 1) / rows;
+        const int64_t n_items = (int64_t) *few_tok_n_active * nchunk0;
+
+        int64_t item = ith;
+        while (item < n_items) {
+            const int     cur_a = active_experts[item / nchunk0];
+            const int64_t c     = item % nchunk0;
+            ggml_compute_forward_mul_mat_id_one_chunk(
+                dst, src0, src1, ids, cur_a,
+                c*rows, MIN((c + 1)*rows, nr0), 0, matrix_row_counts[cur_a],
+                (const char *) src0->data + cur_a*nb02, matrix_rows, row_size, src1_cont, wdata
+            );
+            item = atomic_fetch_add_explicit(few_tok_next, 1, memory_order_relaxed);
+        }
+        return;
+    }
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -2986,6 +3031,8 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // few-token path: active experts, shared counter
+                        cur += n_as*sizeof(int32_t) + sizeof(int64_t) + 2*CACHE_LINE_SIZE;
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
