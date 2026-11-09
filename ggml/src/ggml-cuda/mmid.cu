@@ -177,3 +177,66 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
     }
 }
+
+__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mm_ids_helper_slots(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int expert = blockIdx.x;
+    const int npairs = n_tokens*n_expert_used;
+
+    int nex_prev = 0; // valid (token, slot) pairs of the experts with a lower index
+    for (int p = threadIdx.x; p < npairs; p += warp_size) {
+        const int it  = p / n_expert_used;
+        const int iex = p - it*n_expert_used;
+        const int e   = ids[it*si1 + iex];
+        nex_prev += e >= 0 && e < expert;
+    }
+    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+
+    int it_compact = 0;
+    for (int p0 = 0; p0 < npairs; p0 += warp_size) {
+        const int p = p0 + threadIdx.x;
+        int it  = 0;
+        int iex = 0;
+        int hit = 0;
+        if (p < npairs) {
+            it  = p / n_expert_used;
+            iex = p - it*n_expert_used;
+            hit = ids[it*si1 + iex] == expert;
+        }
+        // inclusive prefix sum over the warp
+        int pos = hit;
+#pragma unroll
+        for (int offset = 1; offset < warp_size; offset <<= 1) {
+            const int tmp = __shfl_up_sync(0xFFFFFFFF, pos, offset, warp_size);
+            if (threadIdx.x >= static_cast<unsigned int>(offset)) {
+                pos += tmp;
+            }
+        }
+        if (hit) {
+            const int row = nex_prev + it_compact + pos - 1;
+            ids_dst[row]  = it*n_expert_used + iex;
+            ids_src1[row] = it*sis1 + iex % nchannels_y;
+        }
+        it_compact += __shfl_sync(0xFFFFFFFF, pos, warp_size - 1, warp_size);
+    }
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+    expert_bounds[expert] = nex_prev;
+    if (expert == static_cast<int>(gridDim.x) - 1) {
+        expert_bounds[gridDim.x] = nex_prev + it_compact;
+    }
+}
+
+void ggml_cuda_launch_mm_ids_helper_slots(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
+    const int id = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[id].warp_size;
+    mm_ids_helper_slots<<<dim3(n_experts, 1, 1), dim3(warp_size, 1, 1), 0, stream>>>
+        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used, nchannels_y, si1, sis1);
+}

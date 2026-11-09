@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "unary.cuh"
+#include "tq1r.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -96,6 +97,15 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ1_0_X2:
+        case GGML_TYPE_TQ1_0_X3:
+        case GGML_TYPE_TQ1_0_X4:
+        case GGML_TYPE_TQ1_0R_1024:
+        case GGML_TYPE_TQ1_0R_1024_X2:
+        case GGML_TYPE_TQ1_0R_1024_X3:
+        case GGML_TYPE_TQ1_0R_1024_X4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         default:
             GGML_ABORT("fatal error");
@@ -230,6 +240,17 @@ struct ggml_cuda_mmq_config {
 #undef CASE
 
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
+    // ternary types (one plane at a time in the Q8_0 tile layout): same tiling as Q8_0
+    if (ggml_cuda_tq_planes(type) > 0) {
+        ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(GGML_TYPE_Q8_0, J, fallback, cc, prec_src1);
+        if (config.type != GGML_TYPE_COUNT) {
+            config.type     = type;
+            // tiling: MUL_MAT_ID loops over the column tiles of an expert (see mul_mat_q), whose row count is only
+            // known on the device (repeated experts); stream-k would need the worst case in the grid
+            config.stream_k = false;
+        }
+        return config;
+    }
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
             return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
@@ -268,6 +289,16 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
 }
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
+    if (ggml_cuda_tq_planes(type) > 0) {
+        ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(GGML_TYPE_Q8_0, J, fallback, prec_src1);
+        if (config.type != GGML_TYPE_COUNT) {
+            config.type     = type;
+            // tiling: MUL_MAT_ID loops over the column tiles of an expert (see mul_mat_q), whose row count is only
+            // known on the device (repeated experts); stream-k would need the worst case in the grid
+            config.stream_k = false;
+        }
+        return config;
+    }
 #ifdef GGML_USE_HIP
 #ifdef GCN
     return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
@@ -419,6 +450,15 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_IQ1_S:   return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_XS:  return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_NL:  return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ1_0_X2:
+        case GGML_TYPE_TQ1_0_X3:
+        case GGML_TYPE_TQ1_0_X4:
+        case GGML_TYPE_TQ1_0R_1024:
+        case GGML_TYPE_TQ1_0R_1024_X2:
+        case GGML_TYPE_TQ1_0R_1024_X3:
+        case GGML_TYPE_TQ1_0R_1024_X4:
+                                return MMQ_DP4A_TXS_Q8_0;
         default:                return tile_x_sizes{0, 0, 0};
     }
 }
@@ -715,6 +755,20 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback, prec_src1>,
                     ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+// ---------------------------------------------------------------------------------------------
+            case GGML_TYPE_TQ1_0:
+            case GGML_TYPE_TQ1_0_X2:
+            case GGML_TYPE_TQ1_0_X3:
+            case GGML_TYPE_TQ1_0_X4:
+            case GGML_TYPE_TQ1_0R_1024:
+            case GGML_TYPE_TQ1_0R_1024_X2:
+            case GGML_TYPE_TQ1_0R_1024_X3:
+            case GGML_TYPE_TQ1_0R_1024_X4:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_Q8_0_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             default:
                 return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);
         }
@@ -885,6 +939,20 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback, prec_src1>,
                 ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback, prec_src1>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
+// ---------------------------------------------------------------------------------------------
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ1_0_X2:
+        case GGML_TYPE_TQ1_0_X3:
+        case GGML_TYPE_TQ1_0_X4:
+        case GGML_TYPE_TQ1_0R_1024:
+        case GGML_TYPE_TQ1_0R_1024_X2:
+        case GGML_TYPE_TQ1_0R_1024_X3:
+        case GGML_TYPE_TQ1_0R_1024_X4:
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
         default:
             return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);
     }
@@ -951,39 +1019,48 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+    // Packed ternary types: the weight is the sum of nplanes planes with their own scales. Every plane is loaded
+    // as its own x tile (the loader reads the first plane of each packed block, x is shifted to the plane) and
+    // dotted with the same y data, accumulating into the same sums.
+    constexpr int    nplanes     = ggml_cuda_tq_planes(type) > 0 ? ggml_cuda_tq_planes(type) : 1;
+    constexpr size_t plane_bytes = ggml_cuda_tq_planes(type) > 0 ? ggml_cuda_tq_plane_bytes(type) : 0;
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
-        {
-            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll 1
+        for (int pl = 0; pl < nplanes; ++pl) {
+            load_tiles(x + pl*plane_bytes, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                    tile_y[l] = by0[l];
+                }
             }
-        }
 
-        __syncthreads();
+            __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, 0);
+            vec_dot(tile_x, tile_y, sum, 0);
 
-        __syncthreads();
+            __syncthreads();
 
-        {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                    tile_y[l] = by0[l];
+                }
             }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
         }
-
-        __syncthreads();
-
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
-
-        __syncthreads();
     }
 
     if (fixup) {
@@ -1050,70 +1127,79 @@ static __global__ void mul_mat_q(
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         const int zt = tmp2.y;
-        const int jt = blockIdx.x;
         const int it = blockIdx.y;
 
-        // Defaults for regular matrix multiplication:
-        int col_low    = 0;
-        int col_high   = ncols_dst;
-        int col_diff   = ncols_dst;
-        int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
-        int offset_y_scale;
-        if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
-        } else {
-            GGML_UNUSED(offset_y_scale);
-        }
+        // Ternary types, MUL_MAT_ID: an expert repeated within a token can have more rows than the grid has column
+        // tiles (the grid is sized for the number of tokens), so the block loops over the column tiles of the expert.
+        constexpr bool loop_jt = ggml_cuda_tq_planes(type) > 0;
+        for (int jt = blockIdx.x; ; jt += gridDim.x) {
 
-        if (ids_dst) {
-            col_low  = expert_bounds[zt + 0];
-            col_high = expert_bounds[zt + 1];
-            col_diff = col_high - col_low;
-
-            offset_y   = 0;
-            offset_dst = 0;
+            // Defaults for regular matrix multiplication:
+            int col_low    = 0;
+            int col_high   = ncols_dst;
+            int col_diff   = ncols_dst;
+            int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
+            int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+            int offset_y_scale;
             if constexpr (type == GGML_TYPE_NVFP4) {
-                offset_y_scale = 0;
+                offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
+            } else {
+                GGML_UNUSED(offset_y_scale);
             }
 
-            if (jt*J >= col_diff) {
-                return;
-            }
+            if (ids_dst) {
+                col_low  = expert_bounds[zt + 0];
+                col_high = expert_bounds[zt + 1];
+                col_diff = col_high - col_low;
 
-            // __syncthreads(); // There is no previous tile that could cause a race condition.
-#pragma unroll
-            for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
-                const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
-
-                if (j0 + nwarps*warp_size > J && j >= J) {
-                    break;
+                offset_y   = 0;
+                offset_dst = 0;
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    offset_y_scale = 0;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                if (jt*J >= col_diff) {
+                    return;
+                }
+
+                if (loop_jt && jt != (int) blockIdx.x) {
+                    __syncthreads(); // the previous tile of this block is done with ids_dst_shared
+                }
+    #pragma unroll
+                for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+                    const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    if (j0 + nwarps*warp_size > J && j >= J) {
+                        break;
+                    }
+
+                    ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                }
+                __syncthreads();
             }
-            __syncthreads();
+
+            offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+            offset_dst += it*I_dst;
+            const float * y_scale_tile = nullptr;
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                offset_y_scale += col_low + jt*J;
+                y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
+            }
+
+            const int tile_x_max_i = nrows_x  - it*I_dst - 1;
+            const int tile_y_max_j = col_diff - jt*J - 1;
+
+            const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I_dst*stride_row_x;
+
+            constexpr bool fixup = false;
+            mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, has_fusion>
+                (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+                 glu_op, glu_limit, stride_row_x, ncols_y, stride_col_dst,
+                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+            if (!loop_jt || !ids_dst) {
+                return;
+            }
         }
-
-        offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
-        offset_dst += it*I_dst;
-        const float * y_scale_tile = nullptr;
-        if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale += col_low + jt*J;
-            y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
-        }
-
-        const int tile_x_max_i = nrows_x  - it*I_dst - 1;
-        const int tile_y_max_j = col_diff - jt*J - 1;
-
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I_dst*stride_row_x;
-
-        constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, has_fusion>
-            (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
-             glu_op, glu_limit, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
-        return;
     }
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1);
@@ -1652,6 +1738,15 @@ extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
+// -----------------------------------------
+extern DECL_MMQ_CASE(GGML_TYPE_TQ1_0);
+extern DECL_MMQ_CASE(GGML_TYPE_TQ1_0_X2);
+extern DECL_MMQ_CASE(GGML_TYPE_TQ1_0_X3);
+extern DECL_MMQ_CASE(GGML_TYPE_TQ1_0_X4);
+extern DECL_MMQ_CASE(GGML_TYPE_TQ1_0R_1024);
+extern DECL_MMQ_CASE(GGML_TYPE_TQ1_0R_1024_X2);
+extern DECL_MMQ_CASE(GGML_TYPE_TQ1_0R_1024_X3);
+extern DECL_MMQ_CASE(GGML_TYPE_TQ1_0R_1024_X4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
