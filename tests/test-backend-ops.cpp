@@ -12822,6 +12822,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, 512, 2048, {1, 1}, {1, 1}));
     }
 
+    // ternary MoE token generation (batch 1) with the experts on the CPU (-ncmoe): gate/up 2048->512 with the
+    // activation broadcast to the 8 used experts, down 512->2048 with one activation row per used expert
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0, GGML_TYPE_TQ1_0_X2, GGML_TYPE_TQ1_0_X3, GGML_TYPE_TQ1_0_X4,
+                             GGML_TYPE_TQ1_0R_1024, GGML_TYPE_TQ1_0R_1024_X2, GGML_TYPE_TQ1_0R_1024_X3, GGML_TYPE_TQ1_0R_1024_X4,
+                             GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, true,  512,  1, 2048));
+        if (ggml_blck_size(type_a) <= 512) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, 1, 512));
+        }
+    }
+
+    // token generation (batch 1) dense shapes of the 35B-A3B models: qkv, attn gate, ssm_out/attn_output,
+    // shared expert gate/up and down, output head
+    for (ggml_type type_a : {GGML_TYPE_TQ1_0R_1024_X3, GGML_TYPE_TQ1_0R_1024_X4, GGML_TYPE_TQ1_0_X3, GGML_TYPE_TQ1_0_X4,
+                             GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{8192, 2048}, {4096, 2048}, {2048, 4096}, {512, 2048}, {2048, 512}, {248320, 2048}}) {
+            if (mk.second % ggml_blck_size(type_a) != 0) {
+                continue;
+            }
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, 1, mk.second, {1, 1}, {1, 1}));
+        }
+    }
+
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 
@@ -13948,7 +13971,8 @@ int main(int argc, char ** argv) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (ggml_backend_set_n_threads_fn) {
-            ggml_backend_set_n_threads_fn(backend.get(), std::max<int>(1, N_THREADS/2));
+            const char * nt_env = getenv("GGML_TEST_N_THREADS");
+            ggml_backend_set_n_threads_fn(backend.get(), nt_env ? std::max(1, atoi(nt_env)) : std::max<int>(1, N_THREADS/2));
         }
 
         size_t free, total;  // NOLINT
