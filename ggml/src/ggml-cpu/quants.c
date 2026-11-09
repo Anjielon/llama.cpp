@@ -151,7 +151,7 @@ void quantize_row_tq1_0_x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT v
     quantize_row_tq1_0_x4_ref(x, (block_tq1_0_x4 *) vy, k);
 }
 
-void quantize_row_q8_K_rot1024(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+void quantize_row_q8_K_rot1024_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK_TQ1_0R_1024 == 0);
     block_q8_K * GGML_RESTRICT y = vy;
     float tmp[QK_TQ1_0R_1024];
@@ -679,7 +679,7 @@ void ggml_vec_dot_tq1_0r_1024_q8_K_generic(int n, float * GGML_RESTRICT s, size_
 
 // packed multi-plane types: the planes of a block share the activation block, dot plane by plane
 #define GGML_PACKED_DOT(NAME, BASE, QK, K)                                                                       \
-void ggml_vec_dot_##NAME##_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,        \
+void ggml_vec_dot_##NAME##_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,\
                                 size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {                 \
     assert(nrc == 1);                                                                                            \
     UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);                                                             \
@@ -690,7 +690,7 @@ void ggml_vec_dot_##NAME##_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const
     for (int i = 0; i < nb; ++i) {                                                                               \
         for (int pl = 0; pl < K; ++pl) {                                                                         \
             float t;                                                                                             \
-            ggml_vec_dot_##BASE##_q8_K(QK, &t, 0, &x[i].p[pl], 0, y + i * (QK / QK_K), 0, 1);                    \
+            ggml_vec_dot_##BASE##_q8_K_generic(QK, &t, 0, &x[i].p[pl], 0, y + i * (QK / QK_K), 0, 1);            \
             sumf += t;                                                                                           \
         }                                                                                                        \
     }                                                                                                            \

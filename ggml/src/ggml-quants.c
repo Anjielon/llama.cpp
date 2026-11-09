@@ -2583,6 +2583,10 @@ static inline void ggml_tq1_0r_1024_apply_sign(float * GGML_RESTRICT v) {
     }
 }
 
+const int8_t * ggml_tq1_0r_1024_signs(void) {
+    return ggml_tq1_0r_1024_sign;
+}
+
 void ggml_tq1_0r_1024_rotate_act(float * GGML_RESTRICT v) {
     ggml_tq1_0r_1024_apply_sign(v);
     ggml_tq1_0r_1024_fwht(v);

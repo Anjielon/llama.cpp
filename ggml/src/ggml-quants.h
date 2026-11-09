@@ -84,6 +84,8 @@ GGML_API void dequantize_row_tq1_0_x4      (const block_tq1_0_x4       * GGML_RE
 // TQ1_0R_1024 activation transform: v -> H(S*v), in place, on 1024 floats.
 // Since H is symmetric and orthonormal, dot(dequant(q), x) == dot(d*q, H(S*x)).
 GGML_API void ggml_tq1_0r_1024_rotate_act(float * GGML_RESTRICT v);
+// the +-1 signs S of the TQ1_0R_1024 rotation (QK_TQ1_0R_1024 entries), for backends with their own kernel
+GGML_API const int8_t * ggml_tq1_0r_1024_signs(void);
 
 GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
