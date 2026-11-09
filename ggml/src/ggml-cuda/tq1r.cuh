@@ -233,6 +233,14 @@ void ggml_cuda_tq1r_rotate_f32(const float * x, float * y, int64_t ne10, int64_t
 // cuBLAS path, which would round the sum of the planes to fp16) and by ggml_cuda_mul_mat_tq1r for large batches.
 void ggml_cuda_mul_mat_tq_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// Mat-vec for every ternary type (tqvec.cu): MUL_MAT with ne11 <= TQ1R_MMV_MAX_BATCH, MUL_MAT_ID with
+// n_tokens <= TQ1R_MMID_MAX_BATCH (one (token, slot) per launch column; ids < 0 give zero rows).
+// Default path; GGML_CUDA_TQ_VEC=0 selects the previous kernels (MMVQ for the TQ1_0 family, the byte-order
+// int8 mat-vec of tq1r.cu for the TQ1_0R_1024 family).
+bool ggml_cuda_tq_vec_enabled();
+void ggml_cuda_mul_mat_tq_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                              const ggml_tensor * ids, ggml_tensor * dst);
+
 // MUL_MAT_ID: max number of tokens served by the int8 mat-vec kernel.
 #define TQ1R_MMID_MAX_BATCH 8
 // MUL_MAT: max ne11 served by the int8 mat-vec kernel (= MMVQ_MAX_BATCH_SIZE).

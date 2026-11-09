@@ -1980,8 +1980,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
-    // the TQ1_0R_1024 family has its own rotated int8 mat-vec (tq1r.cu), not the MMVQ templates
-    if (ggml_cuda_tq_is_r1024(src0->type)) {
+    // the TQ1_0R_1024 family has its own rotated int8 mat-vec (tq1r.cu), not the MMVQ templates; with the
+    // ternary mat-vec (tqvec.cu) the TQ1_0 family does not use MMVQ either
+    if (ggml_cuda_tq_is_r1024(src0->type) || (ggml_cuda_tq_planes(src0->type) > 0 && ggml_cuda_tq_vec_enabled())) {
         return false;
     }
 
@@ -2133,6 +2134,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ggml_cuda_tq_planes(src0->type) > 0 && ggml_cuda_tq_vec_enabled() && ne11 <= TQ1R_MMV_MAX_BATCH &&
+            (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32) {
+        ggml_cuda_mul_mat_tq_vec(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     if (ggml_cuda_tq_is_r1024(src0->type)) {
         ggml_cuda_mul_mat_tq1r(ctx, src0, src1, nullptr, dst, /*force_batch =*/ false);
         return;
@@ -2203,7 +2209,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (ggml_cuda_tq_is_r1024(src0->type)) { // int8 mat-vec id up to TQ1R_MMID_MAX_BATCH tokens, then MMQ or sorted path
+    if (ggml_cuda_tq_is_r1024(src0->type) || (ggml_cuda_tq_planes(src0->type) > 0 && ggml_cuda_tq_vec_enabled())) {
+        // int8 mat-vec id up to TQ1R_MMID_MAX_BATCH tokens, then MMQ or sorted path
         if (dst->ne[2] <= TQ1R_MMID_MAX_BATCH) {
             return false;
         }
@@ -2244,7 +2251,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
-    // TQ1_0R_1024 family experts, few tokens -> rotated int8 mat-vec per (token, slot)
+    // ternary experts, few tokens -> int8 mat-vec per (token, slot)
+    if (ggml_cuda_tq_planes(src0->type) > 0 && ggml_cuda_tq_vec_enabled() && ne2 <= TQ1R_MMID_MAX_BATCH) {
+        ggml_cuda_mul_mat_tq_vec(ctx, src0, src1, ids, dst);
+        return;
+    }
     if (ggml_cuda_tq_is_r1024(src0->type) && ne2 <= TQ1R_MMID_MAX_BATCH) {
         ggml_cuda_mul_mat_tq1r(ctx, src0, src1, ids, dst, /*force_batch =*/ false);
         return;
