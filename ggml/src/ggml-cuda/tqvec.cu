@@ -387,10 +387,11 @@ void ggml_cuda_mul_mat_tq_vec(ggml_backend_cuda_context & ctx, const ggml_tensor
     p.ids_s0 = ids ? ids->nb[0]/ggml_type_size(ids->type) : 0;
     p.ids_s1 = ids ? ids->nb[1]/ggml_type_size(ids->type) : 0;
 
-    // rows per warp (ncols == 1) and warps per block: GGML_CUDA_TQ_VEC_ROWS, GGML_CUDA_TQ_VEC_WARPS
-    static const int env_rows  = tqvec_env_int("GGML_CUDA_TQ_VEC_ROWS",  2);
+    // warps per block (GGML_CUDA_TQ_VEC_WARPS, default 4) and rows per warp for ncols == 1 (GGML_CUDA_TQ_VEC_ROWS
+    // forces 1, 2 or 4): 4 rows when that still gives at least 2 blocks per SM, else 2 (measured on an RTX 4060:
+    // 4 rows are faster for the large and MUL_MAT_ID shapes, 2 for a single 512-row matrix)
+    static const int env_rows  = tqvec_env_int("GGML_CUDA_TQ_VEC_ROWS",  0);
     static const int env_warps = tqvec_env_int("GGML_CUDA_TQ_VEC_WARPS", 4);
-    const int R      = env_rows == 1 || env_rows == 4 ? env_rows : 2;
     const int nwarps = env_warps >= 1 && env_warps <= 8 ? env_warps : 4;
 
     int ncols;
@@ -406,6 +407,12 @@ void ggml_cuda_mul_mat_tq_vec(ggml_backend_cuda_context & ctx, const ggml_tensor
         GGML_ASSERT(ne11 >= 1 && ne11 <= TQ1R_MMV_MAX_BATCH);
         ncols = (int) ne11;
         gyz   = dim3(1, (unsigned) ne12, (unsigned) ne13);
+    }
+    int R = env_rows == 1 || env_rows == 2 || env_rows == 4 ? env_rows : 0;
+    if (R == 0) {
+        const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        const int64_t blocks4 = (ne01 + 4*nwarps - 1)/(4*nwarps) * (int64_t) gyz.y * gyz.z;
+        R = blocks4 >= 2*nsm ? 4 : 2;
     }
     if (r1024) {
         tqvec_launch<true >(p, K, ncols, R, nwarps, gyz, stream);
