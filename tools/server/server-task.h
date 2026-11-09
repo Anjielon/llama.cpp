@@ -136,6 +136,7 @@ struct task_result_state {
     std::vector<common_chat_msg_diff> diffs;
     common_chat_session chat_session; // owns all parsing for this generation
     common_chat_msg chat_msg;
+    std::string generated_text; // raw text so far, returned as content when the chat parser fails
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
 

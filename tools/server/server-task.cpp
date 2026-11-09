@@ -162,7 +162,17 @@ common_chat_msg task_result_state::update_chat_msg(
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
     auto msg_prv_copy = chat_msg;
-    auto new_msg = is_partial ? chat_session.feed(added) : chat_session.finish(added);
+    generated_text += added.text;
+    // A reply that the chat parser does not recognize (for example a raw /completion of a reasoning model) must not
+    // turn into an HTTP 500 that discards the generation: keep the generated text as the message content.
+    common_chat_msg new_msg;
+    try {
+        new_msg = is_partial ? chat_session.feed(added) : chat_session.finish(added);
+    } catch (const std::exception & e) {
+        SRV_WRN("chat parser not applicable, returning the raw text: %s\n", e.what());
+        new_msg.role    = "assistant";
+        new_msg.content = generated_text;
+    }
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
