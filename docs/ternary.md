@@ -42,7 +42,9 @@ CPU only: `cmake -B build && cmake --build build -j`.
 
 All ternary types must pass on the backend you built (they are compared against the CPU reference).
 
-## Environment switches (all optional; defaults are the tested configuration)
+## Environment switches (all optional)
+
+The paper's accuracy numbers used `GGML_VK_TQ1R_Q8=1` for S and M and the default (off) for XS; all other switches at their defaults.
 
 Vulkan:
 - `GGML_VK_TQ1R_Q8=1` — int8 activations in matrix-vector products for the rotated types (one scale per 256
